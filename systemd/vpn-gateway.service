@@ -1,0 +1,14 @@
+[Unit]
+Description=LAN VPN gateway (route LAN clients through the VPN tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vpngw on
+ExecStop=/usr/local/sbin/vpngw off
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

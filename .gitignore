@@ -1,0 +1,8 @@
+# local test/dev configs — never ship real network details
+vpngw.conf
+*.local.conf
+
+# editor/OS cruft
+.DS_Store
+*.swp
+*~

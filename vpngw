@@ -1,0 +1,612 @@
+#!/usr/bin/env bash
+# vpngw - turn a Raspberry Pi into an on-demand LAN VPN gateway.
+#
+#   vpngw on        enable gateway + DNS  (LAN clients route through the tunnel)
+#   vpngw off       tear everything down
+#   vpngw status    show current state
+#   vpngw restart   off then on
+#   vpngw test      verify the exit IP actually goes through the tunnel
+#   vpngw block <ip> / unblock <ip>     deny a client entirely
+#   vpngw bypass <ip> / unbypass <ip>   let a client skip the tunnel
+#   vpngw clients   show both lists
+#   vpngw enable-boot / disable-boot
+#
+# Config lives in /etc/vpngw.conf
+
+set -uo pipefail
+
+CONF="${VPNGW_CONF:-/etc/vpngw.conf}"
+DNSMASQ_CONF=/etc/dnsmasq.d/vpngw.conf
+SERVICE=vpn-gateway.service
+
+# ----------------------------------------------------------------------------
+# defaults (override in /etc/vpngw.conf)
+# ----------------------------------------------------------------------------
+LAN_IF=""                       # auto-detected if empty (e.g. eth0)
+VPN_IF="xvpn-tun0"              # the VPN tunnel interface
+LAN_CIDR=""                     # auto-detected if empty (e.g. 192.168.1.0/24)
+UPSTREAM_DNS="1.1.1.1 9.9.9.9"  # resolvers dnsmasq forwards to (through the tunnel)
+KILL_SWITCH=yes                 # drop client traffic when the tunnel is down
+DNS_LEAK_GUARD=yes              # also block the Pi's own queries to UPSTREAM_DNS outside the tunnel
+BLOCK_IPV6=yes                  # stop clients leaking over IPv6
+DNS_CACHE_SIZE=1000
+DNSMASQ_SERVICE=dnsmasq
+
+# Per-client exceptions (space-separated IPs or CIDRs, managed by the CLI)
+BLOCK_IPS=""                    # denied entirely — no internet through the Pi at all
+BYPASS_IPS=""                   # skip the tunnel, go out the normal uplink instead
+
+# Local accounts on the Pi whose outbound traffic is dropped. They can still
+# log in over SSH — only what they try to send out is blocked.
+BLOCK_USERS=""
+SSH_PORT=22                     # exempted so blocking never kills a live session
+
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_WARN=$'\033[33m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+[ -t 1 ] || { C_OK=; C_BAD=; C_WARN=; C_DIM=; C_OFF=; }
+
+log()  { printf '  %s\n' "$*"; }
+ok()   { printf '  %s✔%s %s\n' "$C_OK" "$C_OFF" "$*"; }
+warn() { printf '  %s!%s %s\n' "$C_WARN" "$C_OFF" "$*"; }
+die()  { printf '  %s✘%s %s\n' "$C_BAD" "$C_OFF" "$*" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "run as root (sudo vpngw $*)"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+iface_exists() { [ -e "/sys/class/net/$1" ]; }
+
+iface_up() {
+    iface_exists "$1" || return 1
+    [ "$(cat "/sys/class/net/$1/operstate" 2>/dev/null)" = "up" ] ||
+        [ "$(cat "/sys/class/net/$1/operstate" 2>/dev/null)" = "unknown" ]
+}
+
+detect_lan_if() {
+    # first global IPv4 interface that is not a tunnel / loopback
+    ip -o -4 addr show scope global 2>/dev/null |
+        awk '$2 !~ /^(lo|tun|tap|wg|ppp|xvpn)/ {print $2; exit}'
+}
+
+detect_lan_cidr() {
+    ip -4 route show dev "$LAN_IF" scope link proto kernel 2>/dev/null |
+        awk '{print $1; exit}'
+}
+
+lan_ip() {
+    ip -o -4 addr show dev "$LAN_IF" scope global 2>/dev/null |
+        awk '{print $4; exit}' | cut -d/ -f1
+}
+
+vpn_ip() {
+    ip -o -4 addr show dev "$VPN_IF" 2>/dev/null | awk '{print $4; exit}'
+}
+
+LAN_IP=""
+
+# fills in whatever it can, never fails — used by 'status'
+resolve_soft() {
+    [ -n "$LAN_IF" ]   || LAN_IF="$(detect_lan_if)"
+    if [ -n "$LAN_IF" ] && iface_exists "$LAN_IF"; then
+        [ -n "$LAN_CIDR" ] || LAN_CIDR="$(detect_lan_cidr)"
+        LAN_IP="$(lan_ip)"
+    fi
+    return 0
+}
+
+# strict version — used by anything that changes state
+resolve_settings() {
+    resolve_soft
+    [ -n "$LAN_IF" ]       || die "could not detect the LAN interface — set LAN_IF in $CONF"
+    iface_exists "$LAN_IF" || die "LAN interface '$LAN_IF' does not exist"
+    [ -n "$LAN_CIDR" ]     || die "could not detect the LAN subnet — set LAN_CIDR in $CONF"
+    [ -n "$LAN_IP" ]       || die "interface '$LAN_IF' has no IPv4 address"
+    have iptables          || die "iptables not found (apt install iptables)"
+}
+
+# ----------------------------------------------------------------------------
+# firewall (iptables, custom chains so nothing else on the box is touched)
+# ----------------------------------------------------------------------------
+FWD_CHAIN=VPNGW_FWD
+IN_CHAIN=VPNGW_IN
+OUT_CHAIN=VPNGW_OUT
+NAT_CHAIN=VPNGW_NAT
+FWD6_CHAIN=VPNGW_FWD6
+
+ipt()  { iptables  "$@" 2>/dev/null; }
+ipt6() { ip6tables "$@" 2>/dev/null; }
+
+fw_clear() {
+    # unhook jumps (loop in case of duplicates), then flush + delete chains
+    while ipt -C FORWARD -j "$FWD_CHAIN";           do ipt -D FORWARD -j "$FWD_CHAIN"; done
+    while ipt -C INPUT   -j "$IN_CHAIN";            do ipt -D INPUT   -j "$IN_CHAIN"; done
+    while ipt -C OUTPUT  -j "$OUT_CHAIN";           do ipt -D OUTPUT  -j "$OUT_CHAIN"; done
+    while ipt -t nat -C POSTROUTING -j "$NAT_CHAIN"; do ipt -t nat -D POSTROUTING -j "$NAT_CHAIN"; done
+    ipt -F "$FWD_CHAIN"; ipt -X "$FWD_CHAIN"
+    ipt -F "$IN_CHAIN";  ipt -X "$IN_CHAIN"
+    ipt -F "$OUT_CHAIN"; ipt -X "$OUT_CHAIN"
+    ipt -t nat -F "$NAT_CHAIN"; ipt -t nat -X "$NAT_CHAIN"
+
+    if have ip6tables; then
+        while ipt6 -C FORWARD -j "$FWD6_CHAIN"; do ipt6 -D FORWARD -j "$FWD6_CHAIN"; done
+        ipt6 -F "$FWD6_CHAIN"; ipt6 -X "$FWD6_CHAIN"
+    fi
+    return 0
+}
+
+fw_apply() {
+    fw_clear
+
+    iptables -N "$FWD_CHAIN" || die "cannot create iptables chain — is iptables installed?"
+    iptables -N "$IN_CHAIN"
+    iptables -N "$OUT_CHAIN"
+    iptables -t nat -N "$NAT_CHAIN"
+
+    # --- INPUT: blacklisted clients don't get to use our resolver either -----
+    if [ -n "${BLOCK_IPS// /}" ]; then
+        for b in $BLOCK_IPS; do
+            iptables -A "$IN_CHAIN" -i "$LAN_IF" -s "$b" -p udp --dport 53 -j DROP
+            iptables -A "$IN_CHAIN" -i "$LAN_IF" -s "$b" -p tcp --dport 53 -j DROP
+        done
+        iptables -I INPUT 1 -j "$IN_CHAIN"
+    fi
+
+    # --- NAT: masquerade LAN traffic leaving the tunnel ----------------------
+    iptables -t nat -A "$NAT_CHAIN" -s "$LAN_CIDR" -o "$VPN_IF" -j MASQUERADE
+    iptables -t nat -I POSTROUTING 1 -j "$NAT_CHAIN"
+
+    # --- FORWARD -------------------------------------------------------------
+    # 1. blacklisted clients die first, before the conntrack accept, so even
+    #    already-established flows stop the moment you block them
+    for b in $BLOCK_IPS; do
+        iptables -A "$FWD_CHAIN" -i "$LAN_IF" -s "$b" -j DROP
+        iptables -A "$FWD_CHAIN" -o "$LAN_IF" -d "$b" -j DROP
+    done
+
+    # 2. clamp MSS (non-terminating) so TCP survives the smaller tunnel MTU
+    iptables -A "$FWD_CHAIN" -o "$VPN_IF" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu
+
+    # 3. return traffic
+    iptables -A "$FWD_CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+    # 4. bypass clients: forwarded straight back out the uplink, un-NATed, so
+    #    they look exactly as if the Pi weren't in the path
+    for b in $BYPASS_IPS; do
+        iptables -A "$FWD_CHAIN" -i "$LAN_IF" -o "$LAN_IF" -s "$b" -j ACCEPT
+    done
+
+    # 5. everyone else goes through the tunnel
+    iptables -A "$FWD_CHAIN" -i "$LAN_IF" -o "$VPN_IF" -s "$LAN_CIDR" -j ACCEPT
+
+    if [ "$KILL_SWITCH" = yes ]; then
+        # anything from the LAN that did NOT match the tunnel rule above dies here,
+        # so when $VPN_IF is missing/down nothing leaks out over the uplink
+        iptables -A "$FWD_CHAIN" -i "$LAN_IF" -j DROP
+    fi
+    iptables -I FORWARD 1 -j "$FWD_CHAIN"
+
+    # --- OUTPUT: traffic the Pi itself generates -----------------------------
+    local out_rules=0
+
+    # Exemptions come first and are unconditional: a live SSH session's replies
+    # leave sshd with source port 22, so this is what lets a blocked user stay
+    # logged in — and what stops you locking yourself out of the Pi.
+    if [ -n "${BLOCK_USERS// /}" ]; then
+        iptables -A "$OUT_CHAIN" -o lo -j RETURN
+        iptables -A "$OUT_CHAIN" -p tcp --sport "$SSH_PORT" -j RETURN
+        out_rules=1
+    fi
+
+    # don't let our own resolver queries escape the tunnel
+    if [ "$KILL_SWITCH" = yes ] && [ "$DNS_LEAK_GUARD" = yes ]; then
+        for d in $UPSTREAM_DNS; do
+            iptables -A "$OUT_CHAIN" ! -o "$VPN_IF" -d "$d" -p udp --dport 53 -j DROP
+            iptables -A "$OUT_CHAIN" ! -o "$VPN_IF" -d "$d" -p tcp --dport 53 -j DROP
+        done
+        out_rules=1
+    fi
+
+    # blocked local accounts
+    for u in $BLOCK_USERS; do
+        if id -u "$u" >/dev/null 2>&1; then
+            iptables -A "$OUT_CHAIN" -m owner --uid-owner "$u" -j DROP
+            out_rules=1
+        else
+            warn "user '$u' no longer exists — skipping"
+        fi
+    done
+
+    [ "$out_rules" -eq 1 ] && iptables -I OUTPUT 1 -j "$OUT_CHAIN"
+
+    # --- IPv6: block forwarding entirely so clients can't bypass the tunnel --
+    if [ "$BLOCK_IPV6" = yes ] && have ip6tables; then
+        ip6tables -N "$FWD6_CHAIN" 2>/dev/null
+        ip6tables -A "$FWD6_CHAIN" -i "$LAN_IF" -j DROP
+        ip6tables -I FORWARD 1 -j "$FWD6_CHAIN"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# sysctl
+# ----------------------------------------------------------------------------
+set_sysctl() {
+    sysctl -qw net.ipv4.ip_forward="$1"
+    sysctl -qw net.ipv4.conf.all.send_redirects="$2"       2>/dev/null
+    sysctl -qw "net.ipv4.conf.$LAN_IF.send_redirects=$2"   2>/dev/null
+    # loose reverse-path filtering: packets come in and go out on different ifaces
+    sysctl -qw net.ipv4.conf.all.rp_filter="$3"            2>/dev/null
+    sysctl -qw "net.ipv4.conf.$LAN_IF.rp_filter=$3"        2>/dev/null
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# dnsmasq
+# ----------------------------------------------------------------------------
+dnsmasq_supports() { dnsmasq --help 2>/dev/null | grep -q -- "--$1"; }
+
+dns_port_conflict() {
+    # something other than dnsmasq already bound to :53 ?
+    if have ss; then
+        ss -lunp 2>/dev/null | awk '$5 ~ /:53$/ {print}' | grep -qv dnsmasq
+    else
+        return 1
+    fi
+}
+
+dnsmasq_write() {
+    have dnsmasq || die "dnsmasq is not installed (apt install dnsmasq)"
+    mkdir -p /etc/dnsmasq.d
+    {
+        echo "# generated by vpngw — do not edit, edit $CONF instead"
+        echo "interface=$LAN_IF"
+        echo "listen-address=127.0.0.1,$LAN_IP"
+        echo "bind-interfaces"
+        echo "no-dhcp-interface=$LAN_IF"
+        echo "no-resolv"
+        echo "no-poll"
+        for d in $UPSTREAM_DNS; do echo "server=$d"; done
+        echo "cache-size=$DNS_CACHE_SIZE"
+        echo "domain-needed"
+        echo "bogus-priv"
+        echo "stop-dns-rebind"
+        echo "rebind-localhost-ok"
+        if [ "$BLOCK_IPV6" = yes ] && dnsmasq_supports filter-AAAA; then
+            echo "filter-AAAA"
+        fi
+    } > "$DNSMASQ_CONF"
+
+    if ! dnsmasq --test -C /etc/dnsmasq.conf >/dev/null 2>&1; then
+        rm -f "$DNSMASQ_CONF"
+        die "dnsmasq rejected the generated config; nothing was changed"
+    fi
+
+    dns_port_conflict && warn "another process is listening on port 53 (systemd-resolved?) — dnsmasq may fail to bind"
+
+    systemctl restart "$DNSMASQ_SERVICE" ||
+        die "dnsmasq failed to start — see: journalctl -u $DNSMASQ_SERVICE -n 30"
+}
+
+dnsmasq_remove() {
+    rm -f "$DNSMASQ_CONF"
+    if svc_active "$DNSMASQ_SERVICE"; then
+        # if dnsmasq was only here for us, stop it; otherwise reload
+        systemctl stop "$DNSMASQ_SERVICE" || true
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# commands
+# ----------------------------------------------------------------------------
+cmd_on() {
+    need_root on
+    resolve_settings
+
+    printf '\n  %sStarting VPN gateway%s\n' "$C_DIM" "$C_OFF"
+
+    if ! iface_exists "$VPN_IF"; then
+        warn "tunnel '$VPN_IF' is not up yet — rules installed, clients stay blocked until it appears"
+    elif ! iface_up "$VPN_IF"; then
+        warn "tunnel '$VPN_IF' exists but is down"
+    fi
+
+    set_sysctl 1 0 2
+    ok "ip_forward enabled"
+
+    fw_apply
+    ok "firewall rules installed (kill switch: $KILL_SWITCH, ipv6 blocked: $BLOCK_IPV6)"
+
+    dnsmasq_write
+    ok "dnsmasq serving DNS on $LAN_IP:53 → ${UPSTREAM_DNS// /, }"
+
+    if [ "$KILL_SWITCH" = yes ] && [ "$DNS_LEAK_GUARD" = yes ]; then
+        for d in $UPSTREAM_DNS; do
+            if grep -q "^nameserver[[:space:]]*$d\$" /etc/resolv.conf 2>/dev/null; then
+                warn "the Pi's own /etc/resolv.conf uses $d, which the leak guard blocks when the tunnel is down"
+                warn "point /etc/resolv.conf at 127.0.0.1 or set DNS_LEAK_GUARD=no in $CONF"
+                break
+            fi
+        done
+    fi
+
+    printf '\n'
+    log "Point your LAN devices at:"
+    log "  gateway : $LAN_IP"
+    log "  dns     : $LAN_IP"
+    printf '\n'
+}
+
+cmd_off() {
+    need_root off
+    resolve_settings
+
+    printf '\n  %sStopping VPN gateway%s\n' "$C_DIM" "$C_OFF"
+    fw_clear;        ok "firewall rules removed"
+    dnsmasq_remove;  ok "dnsmasq stopped, config removed"
+    set_sysctl 0 1 0
+    ok "ip_forward disabled"
+    printf '\n'
+    warn "clients still pointing at this Pi will lose internet until you change them back"
+    printf '\n'
+}
+
+state_is_on() {
+    have iptables || return 1
+    iptables -S FORWARD 2>/dev/null | grep -q -- "-j $FWD_CHAIN"
+}
+
+svc_active()  { have systemctl && systemctl is-active  --quiet "$1" 2>/dev/null; }
+svc_enabled() { have systemctl && systemctl is-enabled --quiet "$1" 2>/dev/null; }
+
+cmd_status() {
+    resolve_soft
+
+    local st_col st_txt
+    if state_is_on; then st_col="$C_OK"; st_txt="ON"; else st_col="$C_BAD"; st_txt="OFF"; fi
+
+    printf '\n  %sVPN GATEWAY: %s%s%s\n\n' "$C_DIM" "$st_col" "$st_txt" "$C_OFF"
+
+    printf '  %-22s %s\n' "LAN interface"  "${LAN_IF:-?} (${LAN_IP:-no ip})"
+    printf '  %-22s %s\n' "LAN subnet"     "${LAN_CIDR:-?}"
+
+    if iface_up "$VPN_IF"; then
+        printf '  %-22s %s%s%s %s\n' "Tunnel" "$C_OK" "$VPN_IF up" "$C_OFF" "$(vpn_ip)"
+    elif iface_exists "$VPN_IF"; then
+        printf '  %-22s %s%s%s\n' "Tunnel" "$C_WARN" "$VPN_IF exists but down" "$C_OFF"
+    else
+        printf '  %-22s %s%s%s\n' "Tunnel" "$C_BAD" "$VPN_IF missing" "$C_OFF"
+    fi
+
+    printf '  %-22s %s\n' "ip_forward" "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)"
+
+    if svc_active "$DNSMASQ_SERVICE"; then
+        printf '  %-22s %sactive%s (%s)\n' "dnsmasq" "$C_OK" "$C_OFF" "${UPSTREAM_DNS// /, }"
+    else
+        printf '  %-22s %sinactive%s\n' "dnsmasq" "$C_BAD" "$C_OFF"
+    fi
+
+    printf '  %-22s %s\n' "Kill switch"    "$KILL_SWITCH"
+    printf '  %-22s %s\n' "DNS leak guard" "$DNS_LEAK_GUARD"
+    printf '  %-22s %s\n' "IPv6 blocked"   "$BLOCK_IPV6"
+
+    if svc_enabled "$SERVICE"; then
+        printf '  %-22s %s\n' "Start at boot" "yes"
+    else
+        printf '  %-22s %s\n' "Start at boot" "no"
+    fi
+
+    if state_is_on; then
+        printf '\n  %sTraffic counters%s\n' "$C_DIM" "$C_OFF"
+        iptables -vnL "$FWD_CHAIN" 2>/dev/null | tail -n +3 | sed 's/^/  /'
+        printf '\n  %sNAT%s\n' "$C_DIM" "$C_OFF"
+        iptables -t nat -vnL "$NAT_CHAIN" 2>/dev/null | tail -n +3 | sed 's/^/  /'
+    fi
+    printf '\n'
+}
+
+cmd_test() {
+    resolve_settings
+    printf '\n'
+    if ! iface_up "$VPN_IF"; then
+        die "tunnel $VPN_IF is not up"
+    fi
+    have curl || die "curl not installed"
+
+    local direct tunnel
+    tunnel="$(curl -s --max-time 8 --interface "$VPN_IF" https://api.ipify.org || true)"
+    direct="$(curl -s --max-time 8 --interface "$LAN_IF" https://api.ipify.org || true)"
+
+    printf '  %-22s %s\n' "exit IP via $VPN_IF" "${tunnel:-unreachable}"
+    printf '  %-22s %s\n' "exit IP via $LAN_IF" "${direct:-unreachable/blocked}"
+    printf '\n'
+    if [ -n "$tunnel" ] && [ "$tunnel" != "$direct" ]; then
+        ok "tunnel is carrying traffic to a different exit IP"
+    else
+        warn "could not confirm the tunnel is changing your exit IP"
+    fi
+
+    if state_is_on; then
+        local r
+        r="$(dig +short +time=3 +tries=1 @"$LAN_IP" example.com 2>/dev/null | head -1)"
+        [ -n "$r" ] && ok "DNS via $LAN_IP works (example.com → $r)" \
+                    || warn "DNS query to $LAN_IP failed (install dnsutils to test, or check dnsmasq)"
+    fi
+    printf '\n'
+}
+
+# ----------------------------------------------------------------------------
+# per-client lists
+# ----------------------------------------------------------------------------
+valid_target() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]
+}
+
+# rewrite KEY="..." in the config file
+conf_set() {
+    local key="$1" val="$2"
+    [ -f "$CONF" ] || die "$CONF does not exist"
+    if grep -qE "^[[:space:]]*$key=" "$CONF"; then
+        sed -i "s|^[[:space:]]*$key=.*|$key=\"$val\"|" "$CONF"
+    else
+        printf '%s="%s"\n' "$key" "$val" >> "$CONF"
+    fi
+}
+
+list_has()  { printf ' %s ' "$1" | grep -qF " $2 "; }
+list_add()  { list_has "$1" "$2" && { printf '%s' "$1"; return; }; printf '%s' "${1:+$1 }$2"; }
+list_del()  {
+    local out=""
+    for i in $1; do [ "$i" = "$2" ] || out="${out:+$out }$i"; done
+    printf '%s' "$out"
+}
+
+# reapply rules if the gateway is currently running
+reapply() {
+    if state_is_on; then
+        fw_apply
+        ok "rules reloaded"
+    else
+        log "gateway is off — takes effect on the next 'vpngw on'"
+    fi
+}
+
+cmd_list_edit() {
+    local var="$1" action="$2" target="${3:-}"
+    need_root
+    case "$action" in
+        user-block|user-unblock)
+            [ -n "$target" ] || die "usage: vpngw ${action} <username>"
+            id -u "$target" >/dev/null 2>&1 || die "no such local user: '$target'"
+            if [ "$(id -u "$target")" -eq 0 ]; then
+                die "refusing to block root — it would cut off the Pi itself"
+            fi ;;
+        *)
+            [ -n "$target" ] || die "usage: vpngw ${action} <ip|cidr>"
+            valid_target "$target" || die "'$target' is not a valid IPv4 address or CIDR" ;;
+    esac
+    resolve_settings
+
+    local cur new
+    cur="${!var}"
+    case "$action" in
+        block|bypass|user-block)
+            list_has "$cur" "$target" && { warn "$target is already in $var"; exit 0; }
+            new="$(list_add "$cur" "$target")" ;;
+        unblock|unbypass|user-unblock)
+            list_has "$cur" "$target" || { warn "$target is not in $var"; exit 0; }
+            new="$(list_del "$cur" "$target")" ;;
+    esac
+
+    conf_set "$var" "$new"
+    declare -g "$var=$new"
+
+    case "$action" in
+        block)        ok "$target blacklisted — no internet through this Pi" ;;
+        unblock)      ok "$target un-blacklisted" ;;
+        bypass)       ok "$target will skip the tunnel and use the normal uplink" ;;
+        unbypass)     ok "$target goes back through the tunnel" ;;
+        user-block)   ok "user '$target' blocked — outbound traffic dropped, SSH login still works" ;;
+        user-unblock) ok "user '$target' unblocked" ;;
+    esac
+    reapply
+
+    if [ "$action" = user-block ]; then
+        printf '\n'
+        warn "this matches on uid, so anything they run via sudo/root is NOT blocked"
+        local n
+        n="$(pgrep -u "$target" -c . 2>/dev/null || echo 0)"
+        [ "$n" -gt 0 ] && log "'$target' has $n process(es) running — existing connections drop immediately"
+        printf '\n'
+    fi
+}
+
+cmd_clients() {
+    resolve_soft
+    printf '\n  %sClient rules%s\n\n' "$C_DIM" "$C_OFF"
+    printf '  %sBlacklisted%s (no internet at all)\n' "$C_BAD" "$C_OFF"
+    if [ -n "${BLOCK_IPS// /}" ]; then
+        for b in $BLOCK_IPS; do printf '    %s\n' "$b"; done
+    else
+        printf '    %s(none)%s\n' "$C_DIM" "$C_OFF"
+    fi
+    printf '\n  %sBypassing the tunnel%s (normal uplink)\n' "$C_WARN" "$C_OFF"
+    if [ -n "${BYPASS_IPS// /}" ]; then
+        for b in $BYPASS_IPS; do printf '    %s\n' "$b"; done
+    else
+        printf '    %s(none)%s\n' "$C_DIM" "$C_OFF"
+    fi
+    printf '\n  %sBlocked local users%s (can still SSH in, traffic dropped)\n' "$C_BAD" "$C_OFF"
+    if [ -n "${BLOCK_USERS// /}" ]; then
+        for u in $BLOCK_USERS; do
+            if id -u "$u" >/dev/null 2>&1; then
+                printf '    %s (uid %s)\n' "$u" "$(id -u "$u")"
+            else
+                printf '    %s %s(no such user)%s\n' "$u" "$C_WARN" "$C_OFF"
+            fi
+        done
+    else
+        printf '    %s(none)%s\n' "$C_DIM" "$C_OFF"
+    fi
+
+    printf '\n  Everything else in %s goes through %s\n\n' "${LAN_CIDR:-the LAN}" "$VPN_IF"
+}
+
+cmd_enable_boot()  { need_root; systemctl enable "$SERVICE"  && ok "will start at boot"; }
+cmd_disable_boot() { need_root; systemctl disable "$SERVICE" && ok "will not start at boot"; }
+
+usage() {
+    cat <<EOF
+
+  vpngw — Raspberry Pi LAN VPN gateway
+
+    vpngw on             route LAN clients through $VPN_IF, serve DNS
+    vpngw off            remove all rules and stop DNS
+    vpngw restart        off + on
+    vpngw status         show current state
+    vpngw test           check the exit IP and DNS actually use the tunnel
+
+  per-client rules (applied live, no restart needed)
+
+    vpngw block <ip>     blacklist: no internet through this Pi at all
+    vpngw unblock <ip>
+    vpngw bypass <ip>    skip the tunnel, use the normal uplink instead
+    vpngw unbypass <ip>
+
+    vpngw user-block <user>    drop a local account's outbound traffic
+    vpngw user-unblock <user>  (they can still log in over SSH)
+
+    vpngw clients        show all three lists
+
+  other
+
+    vpngw enable-boot    start automatically on boot
+    vpngw disable-boot   don't start on boot
+    vpngw config         edit $CONF
+
+EOF
+}
+
+case "${1:-status}" in
+    on|start|up)       cmd_on ;;
+    off|stop|down)     cmd_off ;;
+    restart|reload)    cmd_off; cmd_on ;;
+    status|st)         cmd_status ;;
+    test|check)        cmd_test ;;
+    block)             cmd_list_edit BLOCK_IPS  block    "${2:-}" ;;
+    unblock)           cmd_list_edit BLOCK_IPS  unblock  "${2:-}" ;;
+    bypass)            cmd_list_edit BYPASS_IPS bypass   "${2:-}" ;;
+    unbypass)          cmd_list_edit BYPASS_IPS unbypass "${2:-}" ;;
+    user-block)        cmd_list_edit BLOCK_USERS user-block   "${2:-}" ;;
+    user-unblock)      cmd_list_edit BLOCK_USERS user-unblock "${2:-}" ;;
+    clients|list)      cmd_clients ;;
+    enable-boot)       cmd_enable_boot ;;
+    disable-boot)      cmd_disable_boot ;;
+    config|edit)       need_root; "${EDITOR:-nano}" "$CONF" ;;
+    -h|--help|help)    usage ;;
+    *)                 usage; exit 1 ;;
+esac
