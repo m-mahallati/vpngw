@@ -28,6 +28,7 @@ if [ ! -f /etc/vpngw.conf ]; then
 
     LAN_IF="$(ip -o -4 addr show scope global | awk '$2 !~ /^(lo|tun|tap|wg|ppp|xvpn)/ {print $2; exit}')"
     LAN_CIDR="$(ip -4 route show dev "$LAN_IF" scope link proto kernel | awk '{print $1; exit}')"
+    LAN_GW="$(ip -4 route show default dev "$LAN_IF" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
     VPN_IF="$(ls /sys/class/net | grep -E '^(xvpn|tun|wg|nordlynx|proton)' | head -1)"
     VPN_IF="${VPN_IF:-xvpn-tun0}"
 
@@ -39,6 +40,11 @@ LAN_IF="$LAN_IF"
 
 # Subnet your LAN clients live on
 LAN_CIDR="$LAN_CIDR"
+
+# Your router. Required for 'vpngw bypass' — that uses policy routing to send
+# a client out this gateway instead of the tunnel. Auto-detected at install
+# time; fill it in by hand if it's blank and you want to use bypass.
+LAN_GATEWAY="$LAN_GW"
 
 # The VPN tunnel interface created by your VPN client
 VPN_IF="$VPN_IF"
@@ -64,6 +70,8 @@ DNSMASQ_SERVICE=dnsmasq
 #   vpngw bypass <ip> / unbypass <ip>   skip the tunnel, use the normal uplink
 BLOCK_IPS=""
 BYPASS_IPS=""
+BYPASS_TABLE=51
+BYPASS_PRIO=100
 
 # Local accounts on the Pi whose outbound traffic is dropped. They can still
 # log in over SSH. Manage with: vpngw user-block <user> / user-unblock <user>

@@ -11,6 +11,12 @@ LAN_IF=""
 # LAN subnet, e.g. 192.168.1.0/24. Leave blank to auto-detect.
 LAN_CIDR=""
 
+# Your router's IP — where 'vpngw bypass' sends clients instead of the tunnel.
+# Auto-detected when possible, but detection fails if your VPN client replaces
+# the default route outright. Set it explicitly if 'vpngw clients' reports that
+# a bypassed client has no active ip rule.
+LAN_GATEWAY=""
+
 # The VPN tunnel interface created by your VPN client.
 VPN_IF="xvpn-tun0"
 
@@ -40,7 +46,13 @@ BLOCK_IPV6=yes
 BLOCK_IPS=""
 
 # vpngw bypass <ip> / unbypass <ip>     — skip the tunnel, use normal uplink
+# (needs LAN_GATEWAY above; implemented with policy routing, not just firewall)
 BYPASS_IPS=""
+
+# Routing table id and ip rule priority used for bypassed clients. Only change
+# these if something else on the Pi already uses them.
+BYPASS_TABLE=51
+BYPASS_PRIO=100
 
 # vpngw user-block <user> / user-unblock <user>
 # Local accounts on the Pi whose outbound traffic is dropped. They can still

@@ -114,7 +114,21 @@ Both accept a single IP or a CIDR range (`192.168.1.32/27`). Changes are written
 
 **block** drops the client's forwarded traffic in both directions *before* the established-connections rule, so open sessions die the moment you block it, and also denies it the Pi's DNS. From that device's point of view the Pi is a black hole.
 
-**bypass** forwards the client straight back out the uplink, un-NATed, so it looks to your router exactly as if the Pi weren't in the path. Note the device is probably still using the Pi for DNS, and dnsmasq resolves over the tunnel — if you want it fully off the VPN, point its DNS at your router too.
+**bypass** sends the client out your normal uplink instead of the tunnel, un-NATed, so it looks to your router exactly as if the Pi weren't in the path.
+
+This one needs policy routing, not just a firewall rule: the kernel picks a route *before* the FORWARD chain runs, so with the VPN up a packet is already bound for the tunnel by the time any iptables rule sees it. `vpngw` therefore adds a source-based `ip rule` per bypassed client, pointing at a small routing table (`BYPASS_TABLE`, default 51) whose default route is your router. The firewall rule alongside it only permits the result.
+
+That means bypass needs to know your router's IP. It's auto-detected — from a LAN-pinned default route, then the full routing table, then the Pi's DHCP lease — but if your VPN client replaces the default route outright, detection can come up empty. Set it explicitly in that case:
+
+```bash
+LAN_GATEWAY="192.168.1.1"
+```
+
+`vpngw clients` shows `(routed via <router>)` for each bypassed client when the rules are actually live, and flags them in red if not. `vpngw doctor` checks the same thing.
+
+A useful side effect: bypassed clients keep working when the tunnel is down, since their routing table has its own default and never depended on the VPN.
+
+Note the device is probably still using the Pi for DNS, and dnsmasq resolves over the tunnel — if you want it fully off the VPN, point its DNS at your router too.
 
 Blocking wins if an address ends up in both lists.
 
@@ -212,6 +226,7 @@ This also assumes your VPN client puts the Pi's **default route** through the tu
 |-----|---------|
 | `LAN_IF` | Pi's ethernet interface, e.g. `eth0` |
 | `LAN_CIDR` | LAN subnet, e.g. `192.168.1.0/24` |
+| `LAN_GATEWAY` | your router — required for `bypass`, auto-detected when possible |
 | `VPN_IF` | tunnel interface, e.g. `xvpn-tun0` |
 | `UPSTREAM_DNS` | space-separated resolvers dnsmasq forwards to |
 | `KILL_SWITCH` | `yes` / `no` |
@@ -228,6 +243,7 @@ This also assumes your VPN client puts the Pi's **default route** through the tu
 | `WATCHDOG_FAILS_BEFORE_ACTION` | consecutive failures before reconnecting |
 | `WATCHDOG_COOLDOWN` | seconds after a restart before checking again |
 | `WEB_PORT` / `WEB_BIND` / `WEB_USER` | dashboard listener and username |
+| `BYPASS_TABLE` / `BYPASS_PRIO` | routing table id and `ip rule` priority used for bypass |
 
 ## Troubleshooting
 
@@ -245,6 +261,8 @@ sudo rm -f /etc/resolv.conf && echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.
 **The Pi itself isn't going through the VPN** — that's your VPN client's routing, not this script. `vpngw` only handles forwarded traffic from other devices.
 
 **Watch what's flowing** — `sudo watch -n1 iptables -vnL VPNGW_FWD` shows live packet counts per rule; a climbing DROP counter means traffic is being blocked.
+
+**A bypassed client is still going through the VPN** — `sudo vpngw clients`. If it says "no ip rule active", the policy route didn't install; the usual cause is that `LAN_GATEWAY` couldn't be auto-detected. Set it explicitly in `/etc/vpngw.conf` and run `sudo vpngw restart`. Confirm with `ip rule show priority 100` and `ip route show table 51`.
 
 **Something's stuck** — `sudo vpngw off` is always safe and fully reverses everything; it never touches rules it didn't create.
 

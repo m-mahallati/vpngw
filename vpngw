@@ -29,6 +29,7 @@ STATE_DIR=/var/lib/vpngw
 LAN_IF=""                       # auto-detected if empty (e.g. eth0)
 VPN_IF="xvpn-tun0"              # the VPN tunnel interface
 LAN_CIDR=""                     # auto-detected if empty (e.g. 192.168.1.0/24)
+LAN_GATEWAY=""                  # your router. Auto-detected; needed for bypass
 UPSTREAM_DNS="1.1.1.1 9.9.9.9"  # resolvers dnsmasq forwards to (through the tunnel)
 KILL_SWITCH=yes                 # drop client traffic when the tunnel is down
 DNS_LEAK_GUARD=yes              # also block the Pi's own queries to UPSTREAM_DNS outside the tunnel
@@ -52,6 +53,10 @@ VPN_RESTART_CMD=""
 WATCHDOG_PING_HOST="1.1.1.1"    # pinged through the tunnel to prove it works
 WATCHDOG_FAILS_BEFORE_ACTION=2  # consecutive failed checks before restarting
 WATCHDOG_COOLDOWN=120           # seconds to wait after a restart before rechecking
+
+# --- policy routing (bypass) ----------------------------------------------
+BYPASS_TABLE=51                 # routing table id used for bypassed clients
+BYPASS_PRIO=100                 # ip rule priority
 
 # --- web dashboard --------------------------------------------------------
 WEB_PORT=8088
@@ -117,6 +122,31 @@ resolve_soft() {
 }
 
 # strict version — used by anything that changes state
+# The LAN router. Needed for bypass: we can't send a client "out the normal
+# uplink" without knowing what the normal next hop is. Once the VPN is up the
+# main-table default may point at the tunnel, so try several sources.
+detect_lan_gateway() {
+    local gw
+    # 1. a default route still pinned to the LAN interface (typical when the
+    #    VPN client adds 0.0.0.0/1 + 128.0.0.0/1 rather than replacing default)
+    gw="$(ip -4 route show default dev "$LAN_IF" 2>/dev/null |
+          awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
+    [ -n "$gw" ] && { printf '%s' "$gw"; return; }
+
+    # 2. anything the VPN stashed away as the original gateway
+    gw="$(ip -4 route show table all 2>/dev/null |
+          awk -v ifc="$LAN_IF" '$1=="default" && $0 ~ ("dev " ifc) {
+              for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' | head -1)"
+    [ -n "$gw" ] && { printf '%s' "$gw"; return; }
+
+    # 3. the DHCP lease the Pi itself got
+    gw="$(awk '/option routers/ {print $3; exit}' \
+          /var/lib/dhcp/dhclient."$LAN_IF".leases 2>/dev/null | tr -d ';')"
+    [ -n "$gw" ] && { printf '%s' "$gw"; return; }
+
+    printf ''
+}
+
 resolve_settings() {
     resolve_soft
     [ -n "$LAN_IF" ]       || die "could not detect the LAN interface — set LAN_IF in $CONF"
@@ -141,19 +171,20 @@ ipt6() { ip6tables "$@" 2>/dev/null; }
 
 fw_clear() {
     # unhook jumps (loop in case of duplicates), then flush + delete chains
-    while ipt -C FORWARD -j "$ACCT_CHAIN";          do ipt -D FORWARD -j "$ACCT_CHAIN"; done
+    local n
+    n=0; while [ "$n" -lt 64 ] && ipt -C FORWARD -j "$ACCT_CHAIN"; do ipt -D FORWARD -j "$ACCT_CHAIN"; n=$((n+1)); done
     ipt -F "$ACCT_CHAIN"; ipt -X "$ACCT_CHAIN"
-    while ipt -C FORWARD -j "$FWD_CHAIN";           do ipt -D FORWARD -j "$FWD_CHAIN"; done
-    while ipt -C INPUT   -j "$IN_CHAIN";            do ipt -D INPUT   -j "$IN_CHAIN"; done
-    while ipt -C OUTPUT  -j "$OUT_CHAIN";           do ipt -D OUTPUT  -j "$OUT_CHAIN"; done
-    while ipt -t nat -C POSTROUTING -j "$NAT_CHAIN"; do ipt -t nat -D POSTROUTING -j "$NAT_CHAIN"; done
+    n=0; while [ "$n" -lt 64 ] && ipt -C FORWARD -j "$FWD_CHAIN"; do ipt -D FORWARD -j "$FWD_CHAIN"; n=$((n+1)); done
+    n=0; while [ "$n" -lt 64 ] && ipt -C INPUT   -j "$IN_CHAIN";  do ipt -D INPUT   -j "$IN_CHAIN";  n=$((n+1)); done
+    n=0; while [ "$n" -lt 64 ] && ipt -C OUTPUT  -j "$OUT_CHAIN"; do ipt -D OUTPUT  -j "$OUT_CHAIN"; n=$((n+1)); done
+    n=0; while [ "$n" -lt 64 ] && ipt -t nat -C POSTROUTING -j "$NAT_CHAIN"; do ipt -t nat -D POSTROUTING -j "$NAT_CHAIN"; n=$((n+1)); done
     ipt -F "$FWD_CHAIN"; ipt -X "$FWD_CHAIN"
     ipt -F "$IN_CHAIN";  ipt -X "$IN_CHAIN"
     ipt -F "$OUT_CHAIN"; ipt -X "$OUT_CHAIN"
     ipt -t nat -F "$NAT_CHAIN"; ipt -t nat -X "$NAT_CHAIN"
 
     if have ip6tables; then
-        while ipt6 -C FORWARD -j "$FWD6_CHAIN"; do ipt6 -D FORWARD -j "$FWD6_CHAIN"; done
+        n=0; while [ "$n" -lt 64 ] && ipt6 -C FORWARD -j "$FWD6_CHAIN"; do ipt6 -D FORWARD -j "$FWD6_CHAIN"; n=$((n+1)); done
         ipt6 -F "$FWD6_CHAIN"; ipt6 -X "$FWD6_CHAIN"
     fi
     return 0
@@ -195,8 +226,9 @@ fw_apply() {
     # 3. return traffic
     iptables -A "$FWD_CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-    # 4. bypass clients: forwarded straight back out the uplink, un-NATed, so
-    #    they look exactly as if the Pi weren't in the path
+    # 4. bypass clients. route_apply() is what actually diverts them out the
+    #    uplink (via policy routing); this rule just permits the result, which
+    #    is why it matches -o LAN_IF rather than the tunnel.
     for b in $BYPASS_IPS; do
         iptables -A "$FWD_CHAIN" -i "$LAN_IF" -o "$LAN_IF" -s "$b" -j ACCEPT
     done
@@ -217,6 +249,9 @@ fw_apply() {
     iptables -N "$ACCT_CHAIN"
     iptables -I FORWARD 1 -j "$ACCT_CHAIN"
     acct_sync
+
+    # --- routing: divert bypassed clients away from the tunnel --------------
+    route_apply
 
     # --- OUTPUT: traffic the Pi itself generates -----------------------------
     local out_rules=0
@@ -257,6 +292,51 @@ fw_apply() {
         ip6tables -A "$FWD6_CHAIN" -i "$LAN_IF" -j DROP
         ip6tables -I FORWARD 1 -j "$FWD6_CHAIN"
     fi
+}
+
+# ----------------------------------------------------------------------------
+# policy routing — what actually makes 'bypass' work
+# ----------------------------------------------------------------------------
+# Firewall rules can't send a packet somewhere else; the routing decision has
+# already happened by the time FORWARD runs. So bypassed clients need their own
+# routing table (default via the LAN router) selected by a source-based ip rule.
+route_clear() {
+    have ip || return 0
+    # bounded: this runs as root at boot, so never risk spinning forever if
+    # 'ip rule del' reports success without actually removing anything
+    local n=0
+    while [ "$n" -lt 64 ] && ip rule del priority "$BYPASS_PRIO" 2>/dev/null; do
+        n=$((n + 1))
+    done
+    [ "$n" -ge 64 ] && warn "gave up removing ip rules at priority $BYPASS_PRIO"
+    ip route flush table "$BYPASS_TABLE" 2>/dev/null
+    return 0
+}
+
+route_apply() {
+    route_clear
+    [ -n "${BYPASS_IPS// /}" ] || return 0
+
+    [ -n "$LAN_GATEWAY" ] || LAN_GATEWAY="$(detect_lan_gateway)"
+    if [ -z "$LAN_GATEWAY" ]; then
+        warn "cannot find your router's IP — bypass will NOT work"
+        warn "set LAN_GATEWAY in $CONF (it's your normal default gateway)"
+        return 0
+    fi
+
+    # a table that reaches the LAN directly and everything else via the router
+    ip route replace "$LAN_CIDR" dev "$LAN_IF" scope link table "$BYPASS_TABLE" 2>/dev/null
+    if ! ip route replace default via "$LAN_GATEWAY" dev "$LAN_IF" \
+            table "$BYPASS_TABLE" 2>/dev/null; then
+        warn "could not install bypass route via $LAN_GATEWAY — bypass will not work"
+        return 0
+    fi
+
+    local b
+    for b in $BYPASS_IPS; do
+        ip rule add from "$b" lookup "$BYPASS_TABLE" priority "$BYPASS_PRIO" 2>/dev/null
+    done
+    return 0
 }
 
 # ----------------------------------------------------------------------------
@@ -374,6 +454,7 @@ cmd_off() {
 
     printf '\n  %sStopping VPN gateway%s\n' "$C_DIM" "$C_OFF"
     fw_clear;        ok "firewall rules removed"
+    route_clear;     ok "policy routes removed"
     dnsmasq_remove;  ok "dnsmasq stopped, config removed"
     set_sysctl 0 1 0
     ok "ip_forward disabled"
@@ -743,6 +824,31 @@ cmd_doctor() {
     [ -n "$VPN_RESTART_CMD" ] && d_ok "watchdog restart command" "$VPN_RESTART_CMD" \
                               || d_warn "VPN_RESTART_CMD is empty" "watchdog can detect but not fix outages"
 
+    printf '\n  %sbypass routing%s\n' "$C_DIM" "$C_OFF"
+    if [ -z "${BYPASS_IPS// /}" ]; then
+        d_ok "no bypass clients configured"
+    else
+        local gw
+        gw="${LAN_GATEWAY:-$(detect_lan_gateway)}"
+        if [ -z "$gw" ]; then
+            d_bad "LAN_GATEWAY unknown" "bypass cannot work — set it in $CONF"
+        else
+            d_ok "router for bypassed clients" "$gw"
+            if state_is_on; then
+                local missing=""
+                for b in $BYPASS_IPS; do
+                    ip rule show priority "$BYPASS_PRIO" 2>/dev/null | grep -q "from $b " ||
+                        missing="$missing $b"
+                done
+                [ -z "$missing" ] && d_ok "ip rules installed" "$(printf '%s' "$BYPASS_IPS" | wc -w) client(s)" \
+                                  || d_bad "missing ip rule for:$missing" "run 'vpngw restart'"
+                ip route show table "$BYPASS_TABLE" 2>/dev/null | grep -q default \
+                    && d_ok "bypass routing table populated" \
+                    || d_bad "routing table $BYPASS_TABLE is empty" "run 'vpngw restart'"
+            fi
+        fi
+    fi
+
     printf '\n  %sDNS%s\n' "$C_DIM" "$C_OFF"
     local holder
     holder="$(dns_port_holder)"
@@ -932,7 +1038,10 @@ cmd_list_edit() {
     case "$action" in
         block)        ok "$target blacklisted — no internet through this Pi" ;;
         unblock)      ok "$target un-blacklisted" ;;
-        bypass)       ok "$target will skip the tunnel and use the normal uplink" ;;
+        bypass)
+            ok "$target will skip the tunnel and use the normal uplink"
+            [ -n "${LAN_GATEWAY:-$(detect_lan_gateway)}" ] ||
+                warn "LAN_GATEWAY is unknown — set it in $CONF or bypass won't take effect" ;;
         unbypass)     ok "$target goes back through the tunnel" ;;
         user-block)   ok "user '$target' blocked — outbound traffic dropped, SSH login still works" ;;
         user-unblock) ok "user '$target' unblocked" ;;
@@ -960,7 +1069,17 @@ cmd_clients() {
     fi
     printf '\n  %sBypassing the tunnel%s (normal uplink)\n' "$C_WARN" "$C_OFF"
     if [ -n "${BYPASS_IPS// /}" ]; then
-        for b in $BYPASS_IPS; do printf '    %s\n' "$b"; done
+        local gw rules
+        gw="${LAN_GATEWAY:-$(detect_lan_gateway)}"
+        rules="$(ip rule show priority "$BYPASS_PRIO" 2>/dev/null)"
+        for b in $BYPASS_IPS; do
+            if printf '%s' "$rules" | grep -q "from $b "; then
+                printf '    %s %s(routed via %s)%s\n' "$b" "$C_DIM" "${gw:-?}" "$C_OFF"
+            else
+                printf '    %s %s← no ip rule active, NOT bypassing%s\n' "$b" "$C_BAD" "$C_OFF"
+            fi
+        done
+        [ -z "$gw" ] && printf '    %sLAN_GATEWAY unknown — set it in %s%s\n' "$C_BAD" "$CONF" "$C_OFF"
     else
         printf '    %s(none)%s\n' "$C_DIM" "$C_OFF"
     fi
