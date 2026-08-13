@@ -47,3 +47,30 @@ BYPASS_IPS=""
 # log in over SSH — only what they send out is blocked.
 BLOCK_USERS=""
 SSH_PORT=22
+
+# --- watchdog ---------------------------------------------------------
+
+# Command that brings your VPN back up when the tunnel dies, e.g.
+# "xvpn connect" or "systemctl restart xvpn". Leave empty and the watchdog
+# still detects and logs outages, it just won't try to fix them.
+# Enable with: vpngw watchdog on
+VPN_RESTART_CMD=""
+
+# Pinged through the tunnel to prove it actually carries traffic — an
+# interface being "up" isn't enough.
+WATCHDOG_PING_HOST="1.1.1.1"
+
+# Consecutive failed checks before the restart command runs (checks are 60s
+# apart, so 2 means roughly two minutes of downtime before acting).
+WATCHDOG_FAILS_BEFORE_ACTION=2
+
+# Seconds to wait after a restart before checking again, so a VPN that's
+# slow to connect doesn't get restarted in a loop.
+WATCHDOG_COOLDOWN=120
+
+# --- web dashboard ----------------------------------------------------
+
+# Set a password with 'vpngw web-passwd', then: vpngw web on
+WEB_PORT=8088
+WEB_BIND=""          # defaults to the Pi's LAN IP; "0.0.0.0" to listen on all
+WEB_USER="admin"

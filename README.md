@@ -20,6 +20,10 @@ Most VPN clients only protect the device they're installed on. This lets any dev
 - **Kill switch** — if the tunnel drops, client traffic is dropped too, not silently sent out the plain uplink
 - **DNS leak guard** — the Pi's own resolver traffic is also confined to the tunnel
 - **Per-client rules, applied live** — `vpngw block <ip>` (no internet at all), `vpngw bypass <ip>` (skip the tunnel), `vpngw user-block <ssh-user>` (drop their outbound traffic, keep their SSH login working)
+- **Web dashboard** — status, live per-client bandwidth, and one-click block/bypass from your phone
+- **Auto-reconnect watchdog** — notices a dead tunnel and runs your VPN's reconnect command
+- **`vpngw doctor`** — diagnoses the whole setup and tells you what's wrong before you hit it
+- **`vpngw scan`** — lists every device on the LAN with its current routing state
 - **IPv6 blocked by default** — no accidental bypass over v6
 - **Self-contained** — dedicated iptables chains, `off` never touches rules it didn't create
 
@@ -51,6 +55,9 @@ sudo nano /etc/vpngw.conf
 sudo vpngw on        # enable — LAN clients now route through the tunnel
 sudo vpngw off       # disable — all rules removed, dnsmasq stopped
 sudo vpngw status    # what's on, tunnel state, packet counters
+sudo vpngw doctor    # diagnose the whole setup
+sudo vpngw scan      # every device on the LAN and how it's routed
+sudo vpngw acct      # per-client bandwidth
 sudo vpngw test      # confirm the exit IP and DNS really use the tunnel
 sudo vpngw restart
 
@@ -59,6 +66,22 @@ sudo vpngw disable-boot
 ```
 
 You can also drive the systemd unit directly (`systemctl start|stop|status vpn-gateway`) — it just calls `vpngw on` / `vpngw off`.
+
+### `vpngw doctor`
+
+Run this first when something isn't working, or right after install. It checks dependencies, root/iptables access, config sanity (including whether the Pi's IP actually falls inside `LAN_CIDR`, and whether it's DHCP-assigned when it shouldn't be), whether the tunnel is up and carrying the default route, whether anything else is squatting on port 53, and whether `/etc/resolv.conf` conflicts with the DNS leak guard. Exits non-zero if it finds a real blocker, so it's usable in scripts.
+
+### `vpngw scan`
+
+```
+IP               MAC                 HOSTNAME               STATE
+────────────────────────────────────────────────────────────────
+192.168.1.20     a4:83:e7:1c:44:90   living-room-tv         tunnel
+192.168.1.42     3c:22:fb:0e:11:a2   kids-ipad              blocked
+192.168.1.77     dc:a6:32:55:31:07   work-laptop            bypass
+```
+
+Pulls from the ARP table and dnsmasq's lease file, so you get hostnames without running a port scan. Uses `nmap -sn` to populate ARP if it happens to be installed, but doesn't require it.
 
 ## Client setup
 
@@ -118,6 +141,48 @@ Two caveats worth knowing:
 - **It matches on uid, so `sudo` escapes it.** Anything the user runs as root comes from uid 0 and is not blocked. If that matters, take them out of the sudo group as well.
 - **Existing connections drop instantly.** The owner match applies per-packet with no conntrack exemption, so downloads and sessions die the moment you run the command. `vpngw user-block` tells you how many processes that user currently has running.
 
+## Web dashboard
+
+A small local dashboard — status, live per-client bandwidth, and one-click block/bypass — so you don't need to SSH in to change something.
+
+```bash
+sudo vpngw web-passwd     # set a password (prompted, stored PBKDF2-hashed)
+sudo vpngw web on         # start it, enabled at boot
+sudo vpngw web status
+sudo vpngw web off
+```
+
+Then open `http://<pi-ip>:8088` from anything on your LAN. It auto-refreshes every 5s.
+
+Notes on how it's built:
+
+- **Python 3 stdlib only** — no Flask, no pip, nothing to keep updated. It's one file.
+- **It never touches iptables itself.** Every state change shells out to the `vpngw` CLI with a fixed argument list (no shell interpolation), against an allowlist of six actions, with IPs validated by regex first. The web layer can't express anything the CLI can't.
+- **HTTP Basic auth**, PBKDF2-SHA256 with 100k iterations, and it binds to the Pi's LAN IP rather than `0.0.0.0` by default. Set `WEB_BIND` if you want to change that.
+- It's plain HTTP on your LAN — fine for a home network, but don't port-forward it to the internet.
+
+Bandwidth comes from a dedicated `VPNGW_ACCT` iptables chain holding target-less counter rules (one per direction per host), which tally bytes and fall through without affecting routing. `vpngw acct` shows the same numbers in the terminal; `vpngw acct reset` zeroes them.
+
+## Watchdog
+
+The kill switch stops leaks when the tunnel dies, but it won't bring the tunnel back. That's what the watchdog is for.
+
+```bash
+sudo vpngw watchdog on
+sudo vpngw watchdog status
+sudo vpngw watchdog off
+```
+
+It runs every 60s via a systemd timer and pings `WATCHDOG_PING_HOST` **through** `VPN_IF` — an interface being "up" doesn't mean it's carrying traffic, so this catches a half-dead tunnel that an interface check would miss. After `WATCHDOG_FAILS_BEFORE_ACTION` consecutive failures it runs your reconnect command:
+
+```bash
+VPN_RESTART_CMD="xvpn connect"
+```
+
+Set that in `/etc/vpngw.conf` first — left empty, the watchdog still detects and logs outages but won't act. `WATCHDOG_COOLDOWN` (default 120s) prevents restart loops while a slow VPN is still connecting, and the watchdog does nothing at all while the gateway is off.
+
+Check what it's been doing with `vpngw watchdog status`, which includes the recent journal entries.
+
 ## What `on` actually does
 
 1. `net.ipv4.ip_forward=1`, ICMP redirects off, loose reverse-path filtering (traffic enters and leaves on different interfaces).
@@ -158,6 +223,11 @@ This also assumes your VPN client puts the Pi's **default route** through the tu
 | `SSH_PORT` | exempted from user blocks so live sessions survive |
 | `DNS_CACHE_SIZE` | dnsmasq cache entries |
 | `DNSMASQ_SERVICE` | systemd unit name for dnsmasq |
+| `VPN_RESTART_CMD` | command the watchdog runs to reconnect, e.g. `xvpn connect` |
+| `WATCHDOG_PING_HOST` | pinged through the tunnel to prove it carries traffic |
+| `WATCHDOG_FAILS_BEFORE_ACTION` | consecutive failures before reconnecting |
+| `WATCHDOG_COOLDOWN` | seconds after a restart before checking again |
+| `WEB_PORT` / `WEB_BIND` / `WEB_USER` | dashboard listener and username |
 
 ## Troubleshooting
 
@@ -187,12 +257,16 @@ sudo rm -f /etc/resolv.conf && echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.
 ## Repo layout
 
 ```
-vpngw               the CLI itself — everything lives in this one script
-install.sh           installer: deps, /usr/local/sbin/vpngw, systemd unit, config
+vpngw                 the CLI — gateway, rules, doctor, scan, watchdog
+vpngw-web             the dashboard (Python 3 stdlib, single file)
+install.sh            installer: deps, binaries, systemd units, config
 systemd/
-  vpn-gateway.service
+  vpn-gateway.service     the gateway itself
+  vpngw-watchdog.service  one watchdog check
+  vpngw-watchdog.timer    runs the check every 60s
+  vpngw-web.service       the dashboard
 examples/
-  vpngw.conf.example  fully-commented config reference
+  vpngw.conf.example      fully-commented config reference
 README.md
 LICENSE
 ```
@@ -201,9 +275,15 @@ LICENSE
 
 ```bash
 sudo vpngw off
+sudo vpngw web off
+sudo vpngw watchdog off
 sudo systemctl disable vpn-gateway 2>/dev/null
-sudo rm -f /usr/local/sbin/vpngw /etc/systemd/system/vpn-gateway.service \
-           /etc/vpngw.conf /etc/dnsmasq.d/vpngw.conf
+sudo rm -f /usr/local/sbin/vpngw /usr/local/sbin/vpngw-web \
+           /etc/systemd/system/vpn-gateway.service \
+           /etc/systemd/system/vpngw-watchdog.{service,timer} \
+           /etc/systemd/system/vpngw-web.service \
+           /etc/vpngw.conf /etc/vpngw.passwd /etc/dnsmasq.d/vpngw.conf
+sudo rm -rf /var/lib/vpngw
 sudo systemctl daemon-reload
 ```
 

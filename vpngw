@@ -18,6 +18,10 @@ set -uo pipefail
 CONF="${VPNGW_CONF:-/etc/vpngw.conf}"
 DNSMASQ_CONF=/etc/dnsmasq.d/vpngw.conf
 SERVICE=vpn-gateway.service
+WATCHDOG_SERVICE=vpngw-watchdog.timer
+WEB_SERVICE=vpngw-web.service
+WEB_PASSWD_FILE=/etc/vpngw.passwd
+STATE_DIR=/var/lib/vpngw
 
 # ----------------------------------------------------------------------------
 # defaults (override in /etc/vpngw.conf)
@@ -40,6 +44,19 @@ BYPASS_IPS=""                   # skip the tunnel, go out the normal uplink inst
 # log in over SSH — only what they try to send out is blocked.
 BLOCK_USERS=""
 SSH_PORT=22                     # exempted so blocking never kills a live session
+
+# --- watchdog -------------------------------------------------------------
+# Command that brings your VPN back up, e.g. "xvpn connect". Left empty the
+# watchdog still detects and logs a dead tunnel, but won't try to fix it.
+VPN_RESTART_CMD=""
+WATCHDOG_PING_HOST="1.1.1.1"    # pinged through the tunnel to prove it works
+WATCHDOG_FAILS_BEFORE_ACTION=2  # consecutive failed checks before restarting
+WATCHDOG_COOLDOWN=120           # seconds to wait after a restart before rechecking
+
+# --- web dashboard --------------------------------------------------------
+WEB_PORT=8088
+WEB_BIND=""                     # defaults to the Pi's LAN IP; "0.0.0.0" for all
+WEB_USER="admin"
 
 # shellcheck source=/dev/null
 [ -r "$CONF" ] && . "$CONF"
@@ -117,12 +134,15 @@ IN_CHAIN=VPNGW_IN
 OUT_CHAIN=VPNGW_OUT
 NAT_CHAIN=VPNGW_NAT
 FWD6_CHAIN=VPNGW_FWD6
+ACCT_CHAIN=VPNGW_ACCT
 
 ipt()  { iptables  "$@" 2>/dev/null; }
 ipt6() { ip6tables "$@" 2>/dev/null; }
 
 fw_clear() {
     # unhook jumps (loop in case of duplicates), then flush + delete chains
+    while ipt -C FORWARD -j "$ACCT_CHAIN";          do ipt -D FORWARD -j "$ACCT_CHAIN"; done
+    ipt -F "$ACCT_CHAIN"; ipt -X "$ACCT_CHAIN"
     while ipt -C FORWARD -j "$FWD_CHAIN";           do ipt -D FORWARD -j "$FWD_CHAIN"; done
     while ipt -C INPUT   -j "$IN_CHAIN";            do ipt -D INPUT   -j "$IN_CHAIN"; done
     while ipt -C OUTPUT  -j "$OUT_CHAIN";           do ipt -D OUTPUT  -j "$OUT_CHAIN"; done
@@ -190,6 +210,13 @@ fw_apply() {
         iptables -A "$FWD_CHAIN" -i "$LAN_IF" -j DROP
     fi
     iptables -I FORWARD 1 -j "$FWD_CHAIN"
+
+    # --- accounting: one counter rule per direction per known host ----------
+    # These rules have no target, so they tally bytes and fall through. Placed
+    # ahead of everything else so blocked traffic is counted too.
+    iptables -N "$ACCT_CHAIN"
+    iptables -I FORWARD 1 -j "$ACCT_CHAIN"
+    acct_sync
 
     # --- OUTPUT: traffic the Pi itself generates -----------------------------
     local out_rules=0
@@ -440,6 +467,403 @@ cmd_test() {
 }
 
 # ----------------------------------------------------------------------------
+# per-client byte accounting
+# ----------------------------------------------------------------------------
+# Add a counter rule pair for any LAN host we know about but aren't counting
+# yet. Cheap and idempotent — safe to call as often as you like.
+acct_sync() {
+    iptables -L "$ACCT_CHAIN" -n >/dev/null 2>&1 || return 0
+    local known ip
+    known="$(iptables -S "$ACCT_CHAIN" 2>/dev/null)"
+    for ip in $(acct_hosts); do
+        printf '%s' "$known" | grep -q -- "-s $ip/32" || iptables -A "$ACCT_CHAIN" -s "$ip"
+        printf '%s' "$known" | grep -q -- "-d $ip/32" || iptables -A "$ACCT_CHAIN" -d "$ip"
+    done
+}
+
+# hosts worth counting: anything in the ARP table plus anything we have a rule for
+acct_hosts() {
+    {
+        ip -4 neigh show dev "$LAN_IF" 2>/dev/null |
+            awk '$3 == "lladdr" && $NF != "FAILED" {print $1}'
+        for i in $BLOCK_IPS $BYPASS_IPS; do printf '%s\n' "${i%%/*}"; done
+    } | sort -u
+}
+
+# emit "ip up_bytes down_bytes" per host
+acct_dump() {
+    # NB: these rules have no target, so the target column is blank and awk's
+    # field numbers shift. Read source/destination from the end instead.
+    iptables -vnxL "$ACCT_CHAIN" 2>/dev/null | awk '
+        NR<3 || NF<6 {next}
+        {
+            bytes=$2; src=$(NF-1); dst=$NF
+            if (src != "0.0.0.0/0") { sub("/32","",src); up[src]+=bytes; seen[src]=1 }
+            if (dst != "0.0.0.0/0") { sub("/32","",dst); down[dst]+=bytes; seen[dst]=1 }
+        }
+        END { for (h in seen) printf "%s %d %d\n", h, up[h]+0, down[h]+0 }'
+}
+
+cmd_acct() {
+    need_root
+    resolve_settings
+    case "${1:-show}" in
+        sync)  acct_sync; ok "accounting rules synced" ;;
+        reset) iptables -Z "$ACCT_CHAIN" 2>/dev/null && ok "counters zeroed" ;;
+        *)
+            state_is_on || die "gateway is off — no counters to show"
+            printf '\n  %-16s %12s %12s\n' "CLIENT" "UP" "DOWN"
+            printf '  %s\n' "$(printf '─%.0s' $(seq 1 42))"
+            acct_dump | sort -t. -k4 -n | while read -r h u d; do
+                printf '  %-16s %12s %12s\n' "$h" "$(human "$u")" "$(human "$d")"
+            done
+            printf '\n' ;;
+    esac
+}
+
+human() {
+    awk -v b="$1" 'BEGIN{
+        split("B KB MB GB TB", u, " "); i=1
+        while (b >= 1024 && i < 5) { b/=1024; i++ }
+        printf (i==1 ? "%d %s" : "%.1f %s"), b, u[i]
+    }'
+}
+
+# ----------------------------------------------------------------------------
+# watchdog — notice a dead tunnel and bring it back
+# ----------------------------------------------------------------------------
+tunnel_healthy() {
+    iface_up "$VPN_IF" || return 1
+    ping -c1 -W3 -I "$VPN_IF" "$WATCHDOG_PING_HOST" >/dev/null 2>&1
+}
+
+cmd_watchdog_check() {
+    need_root
+    resolve_settings
+    mkdir -p "$STATE_DIR"
+    local fail_file="$STATE_DIR/watchdog.fails" last_file="$STATE_DIR/watchdog.last"
+    local fails=0 last=0 now
+    now="$(date +%s)"
+    [ -f "$fail_file" ] && fails="$(cat "$fail_file")"
+    [ -f "$last_file" ] && last="$(cat "$last_file")"
+
+    # nothing to guard if the gateway isn't running
+    if ! state_is_on; then
+        echo 0 > "$fail_file"
+        echo "gateway is off — nothing to watch"
+        return 0
+    fi
+
+    if tunnel_healthy; then
+        [ "$fails" -gt 0 ] && echo "tunnel recovered after $fails failed check(s)"
+        echo 0 > "$fail_file"
+        return 0
+    fi
+
+    fails=$((fails + 1))
+    echo "$fails" > "$fail_file"
+    echo "tunnel check FAILED ($fails/$WATCHDOG_FAILS_BEFORE_ACTION) — $VPN_IF unreachable"
+
+    [ "$fails" -ge "$WATCHDOG_FAILS_BEFORE_ACTION" ] || return 0
+
+    if [ -z "$VPN_RESTART_CMD" ]; then
+        echo "VPN_RESTART_CMD is empty — cannot reconnect automatically. Set it in $CONF"
+        return 0
+    fi
+
+    if [ $((now - last)) -lt "$WATCHDOG_COOLDOWN" ]; then
+        echo "still in cooldown ($((WATCHDOG_COOLDOWN - (now - last)))s left) — not restarting yet"
+        return 0
+    fi
+
+    echo "running: $VPN_RESTART_CMD"
+    echo "$now" > "$last_file"
+    echo 0 > "$fail_file"
+    if eval "$VPN_RESTART_CMD"; then
+        echo "restart command finished ok"
+    else
+        echo "restart command exited non-zero"
+    fi
+}
+
+cmd_watchdog() {
+    case "${1:-status}" in
+        on|start|enable)
+            need_root
+            [ -n "$VPN_RESTART_CMD" ] || warn "VPN_RESTART_CMD is empty — set it in $CONF or this only logs"
+            systemctl enable --now "$WATCHDOG_SERVICE" && ok "watchdog enabled" ;;
+        off|stop|disable)
+            need_root
+            systemctl disable --now "$WATCHDOG_SERVICE" && ok "watchdog disabled" ;;
+        status|*)
+            printf '\n'
+            if svc_enabled "$WATCHDOG_SERVICE"; then
+                printf '  %-22s %senabled%s\n' "watchdog" "$C_OK" "$C_OFF"
+            else
+                printf '  %-22s %sdisabled%s\n' "watchdog" "$C_BAD" "$C_OFF"
+            fi
+            printf '  %-22s %s\n' "restart command" "${VPN_RESTART_CMD:-(unset)}"
+            printf '  %-22s %s\n' "ping target" "$WATCHDOG_PING_HOST"
+            printf '  %-22s %s\n' "fails before action" "$WATCHDOG_FAILS_BEFORE_ACTION"
+            [ -f "$STATE_DIR/watchdog.fails" ] &&
+                printf '  %-22s %s\n' "current fail count" "$(cat "$STATE_DIR/watchdog.fails")"
+            if [ -f "$STATE_DIR/watchdog.last" ]; then
+                printf '  %-22s %s\n' "last restart" \
+                    "$(date -d "@$(cat "$STATE_DIR/watchdog.last")" 2>/dev/null || echo unknown)"
+            fi
+            printf '\n  %srecent activity%s\n' "$C_DIM" "$C_OFF"
+            journalctl -u vpngw-watchdog.service -n 8 --no-pager -o cat 2>/dev/null | sed 's/^/    /' ||
+                log "(no journal available)"
+            printf '\n' ;;
+    esac
+}
+
+# ----------------------------------------------------------------------------
+# web dashboard
+# ----------------------------------------------------------------------------
+cmd_web() {
+    case "${1:-status}" in
+        on|start)
+            need_root
+            [ -f "$WEB_PASSWD_FILE" ] || die "no password set — run: vpngw web-passwd"
+            systemctl enable --now "$WEB_SERVICE" || die "failed to start $WEB_SERVICE"
+            resolve_soft
+            ok "dashboard running at http://${WEB_BIND:-$LAN_IP}:$WEB_PORT" ;;
+        off|stop)
+            need_root
+            systemctl disable --now "$WEB_SERVICE" && ok "dashboard stopped" ;;
+        status|*)
+            resolve_soft
+            printf '\n'
+            if svc_active "$WEB_SERVICE"; then
+                printf '  %-22s %srunning%s  http://%s:%s\n' "dashboard" "$C_OK" "$C_OFF" \
+                    "${WEB_BIND:-$LAN_IP}" "$WEB_PORT"
+            else
+                printf '  %-22s %sstopped%s\n' "dashboard" "$C_BAD" "$C_OFF"
+            fi
+            printf '  %-22s %s\n' "user" "$WEB_USER"
+            [ -f "$WEB_PASSWD_FILE" ] && printf '  %-22s %s\n' "password" "set" \
+                                      || printf '  %-22s %snot set%s — run: vpngw web-passwd\n' \
+                                         "password" "$C_WARN" "$C_OFF"
+            printf '\n' ;;
+    esac
+}
+
+cmd_web_passwd() {
+    need_root
+    have python3 || die "python3 is required for the dashboard"
+    local p1 p2
+    read -rsp "  New dashboard password for '$WEB_USER': " p1; echo
+    read -rsp "  Repeat: " p2; echo
+    [ -n "$p1" ] || die "password cannot be empty"
+    [ "$p1" = "$p2" ] || die "passwords do not match"
+
+    VPNGW_PW="$p1" python3 - "$WEB_PASSWD_FILE" <<'PY' || die "failed to write password file"
+import hashlib, os, sys
+pw = os.environ["VPNGW_PW"].encode()
+salt = os.urandom(16).hex()
+h = hashlib.pbkdf2_hmac("sha256", pw, salt.encode(), 100_000).hex()
+with open(sys.argv[1], "w") as f:
+    f.write(f"{salt}${h}\n")
+PY
+    chmod 600 "$WEB_PASSWD_FILE"
+    ok "password saved to $WEB_PASSWD_FILE"
+    svc_active "$WEB_SERVICE" && { systemctl restart "$WEB_SERVICE"; log "dashboard restarted"; }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# doctor — preflight checks
+# ----------------------------------------------------------------------------
+DOC_FAIL=0
+DOC_WARN=0
+d_ok()   { printf '  %s✔%s %-34s %s\n' "$C_OK"   "$C_OFF" "$1" "${2:-}"; }
+d_warn() { printf '  %s!%s %-34s %s\n' "$C_WARN" "$C_OFF" "$1" "${2:-}"; DOC_WARN=$((DOC_WARN+1)); }
+d_bad()  { printf '  %s✘%s %-34s %s\n' "$C_BAD"  "$C_OFF" "$1" "${2:-}"; DOC_FAIL=$((DOC_FAIL+1)); }
+
+cmd_doctor() {
+    resolve_soft
+    printf '\n  %sVPNGW DOCTOR%s\n\n' "$C_DIM" "$C_OFF"
+
+    printf '  %sdependencies%s\n' "$C_DIM" "$C_OFF"
+    for t in iptables ip sysctl systemctl; do
+        have "$t" && d_ok "$t" || d_bad "$t" "missing — apt install ${t/ip/iproute2}"
+    done
+    have dnsmasq && d_ok "dnsmasq" "$(dnsmasq --version 2>/dev/null | head -1 | awk '{print $3}')" \
+                 || d_bad "dnsmasq" "missing — apt install dnsmasq"
+    have curl    && d_ok "curl"    || d_warn "curl"    "missing — 'vpngw test' won't work"
+    have dig     && d_ok "dig"     || d_warn "dig"     "missing — apt install dnsutils"
+    have python3 && d_ok "python3" || d_warn "python3" "missing — the web dashboard needs it"
+    if [ "$BLOCK_IPV6" = yes ]; then
+        have ip6tables && d_ok "ip6tables" || d_warn "ip6tables" "missing — IPv6 can't be blocked"
+    fi
+
+    printf '\n  %sprivileges%s\n' "$C_DIM" "$C_OFF"
+    [ "$(id -u)" -eq 0 ] && d_ok "running as root" \
+                         || d_warn "not running as root" "some checks skipped; use sudo"
+    if [ "$(id -u)" -eq 0 ]; then
+        iptables -L -n >/dev/null 2>&1 && d_ok "iptables usable" \
+                                       || d_bad "iptables not usable" "kernel modules missing?"
+    fi
+
+    printf '\n  %sconfig%s\n' "$C_DIM" "$C_OFF"
+    [ -r "$CONF" ] && d_ok "config file" "$CONF" \
+                   || d_warn "config file" "$CONF not found — using built-in defaults"
+    if [ -n "$LAN_IF" ] && iface_exists "$LAN_IF"; then
+        d_ok "LAN interface" "$LAN_IF ${LAN_IP:+($LAN_IP)}"
+    else
+        d_bad "LAN interface" "'${LAN_IF:-?}' not found — set LAN_IF in $CONF"
+    fi
+    [ -n "$LAN_CIDR" ] && d_ok "LAN subnet" "$LAN_CIDR" \
+                       || d_bad "LAN subnet" "could not determine — set LAN_CIDR in $CONF"
+    if [ -n "$LAN_IP" ] && [ -n "$LAN_CIDR" ]; then
+        ip_in_cidr "$LAN_IP" "$LAN_CIDR" && d_ok "Pi's IP is inside LAN_CIDR" \
+                                         || d_warn "Pi's IP is outside LAN_CIDR" "$LAN_IP vs $LAN_CIDR"
+    fi
+    if [ -n "$LAN_IP" ] && ip_is_dhcp "$LAN_IF"; then
+        d_warn "LAN IP looks DHCP-assigned" "give the Pi a static IP or clients will break"
+    fi
+
+    printf '\n  %stunnel%s\n' "$C_DIM" "$C_OFF"
+    if iface_up "$VPN_IF"; then
+        d_ok "$VPN_IF is up" "$(vpn_ip)"
+        if [ "$(id -u)" -eq 0 ] && have ip; then
+            local route
+            route="$(ip route get "$WATCHDOG_PING_HOST" 2>/dev/null | head -1)"
+            case "$route" in
+                *"dev $VPN_IF"*) d_ok "default route uses the tunnel" ;;
+                *) d_warn "default route does NOT use the tunnel" "dnsmasq upstream may be blocked" ;;
+            esac
+        fi
+    elif iface_exists "$VPN_IF"; then
+        d_warn "$VPN_IF exists but is down" "connect the VPN"
+    else
+        d_warn "$VPN_IF not present" "connect the VPN, or fix VPN_IF in $CONF"
+    fi
+    [ -n "$VPN_RESTART_CMD" ] && d_ok "watchdog restart command" "$VPN_RESTART_CMD" \
+                              || d_warn "VPN_RESTART_CMD is empty" "watchdog can detect but not fix outages"
+
+    printf '\n  %sDNS%s\n' "$C_DIM" "$C_OFF"
+    local holder
+    holder="$(dns_port_holder)"
+    if [ -z "$holder" ]; then
+        d_ok "port 53 is free"
+    elif [ "$holder" = dnsmasq ]; then
+        d_ok "port 53 held by dnsmasq"
+    else
+        d_bad "port 53 held by '$holder'" "disable it, or dnsmasq won't start"
+    fi
+    if [ "$KILL_SWITCH" = yes ] && [ "$DNS_LEAK_GUARD" = yes ]; then
+        local clash=""
+        for d in $UPSTREAM_DNS; do
+            grep -q "^nameserver[[:space:]]*$d\$" /etc/resolv.conf 2>/dev/null && clash="$d"
+        done
+        [ -n "$clash" ] && d_warn "resolv.conf uses $clash" "the Pi loses DNS when the tunnel drops" \
+                        || d_ok "resolv.conf doesn't clash with the leak guard"
+    fi
+
+    printf '\n  %sruntime%s\n' "$C_DIM" "$C_OFF"
+    if state_is_on; then
+        d_ok "gateway is ON"
+        [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = 1 ] \
+            && d_ok "ip_forward enabled" || d_bad "ip_forward is off" "but the gateway is on?"
+        svc_active "$DNSMASQ_SERVICE" && d_ok "dnsmasq running" \
+                                      || d_bad "dnsmasq not running" "journalctl -u $DNSMASQ_SERVICE"
+    else
+        d_ok "gateway is OFF" "nothing to check — run 'vpngw on' first"
+    fi
+
+    printf '\n'
+    if [ "$DOC_FAIL" -gt 0 ]; then
+        printf '  %s%d problem(s)%s and %d warning(s)\n\n' "$C_BAD" "$DOC_FAIL" "$C_OFF" "$DOC_WARN"
+        return 1
+    elif [ "$DOC_WARN" -gt 0 ]; then
+        printf '  no blockers, %s%d warning(s)%s\n\n' "$C_WARN" "$DOC_WARN" "$C_OFF"
+    else
+        printf '  %severything looks good%s\n\n' "$C_OK" "$C_OFF"
+    fi
+    return 0
+}
+
+dns_port_holder() {
+    have ss || return 0
+    ss -lunpH 2>/dev/null | awk '$5 ~ /:53$/ {
+        if (match($0, /users:\(\("[^"]+"/)) {
+            s = substr($0, RSTART+8); gsub(/".*/, "", s); print s; exit
+        }
+    }'
+}
+
+ip_is_dhcp() {
+    ip -o -4 addr show dev "$1" 2>/dev/null | grep -q "dynamic"
+}
+
+ip_in_cidr() {
+    local ip="$1" cidr="$2"
+    have python3 || return 0
+    python3 - "$ip" "$cidr" <<'PY' 2>/dev/null
+import ipaddress, sys
+try:
+    sys.exit(0 if ipaddress.ip_address(sys.argv[1]) in ipaddress.ip_network(sys.argv[2], strict=False) else 1)
+except Exception:
+    sys.exit(0)
+PY
+}
+
+# ----------------------------------------------------------------------------
+# scan — what's on the LAN right now
+# ----------------------------------------------------------------------------
+client_state() {
+    local ip="$1"
+    list_has "$BLOCK_IPS"  "$ip" && { printf 'blocked'; return; }
+    list_has "$BYPASS_IPS" "$ip" && { printf 'bypass';  return; }
+    printf 'tunnel'
+}
+
+cmd_scan() {
+    resolve_settings
+    printf '\n  %sScanning %s on %s…%s\n' "$C_DIM" "$LAN_CIDR" "$LAN_IF" "$C_OFF"
+
+    # nudge the ARP table: ping the broadcast address, then let replies settle
+    ping -c1 -w1 -b "$(broadcast_addr)" >/dev/null 2>&1 || true
+    if have nmap; then
+        nmap -sn -n --max-retries 1 "$LAN_CIDR" >/dev/null 2>&1 || true
+    fi
+    sleep 1
+
+    local leases=/var/lib/misc/dnsmasq.leases
+    printf '\n  %-16s %-19s %-22s %s\n' "IP" "MAC" "HOSTNAME" "STATE"
+    printf '  %s\n' "$(printf '─%.0s' $(seq 1 72))"
+
+    ip -4 neigh show dev "$LAN_IF" 2>/dev/null |
+        awk '$3 == "lladdr" && $NF != "FAILED" {print $1, $4}' |
+        sort -t. -k4 -n |
+        while read -r ip mac; do
+            local host="" st col
+            [ -f "$leases" ] && host="$(awk -v m="$mac" '$2 == m {print $4; exit}' "$leases")"
+            [ -z "$host" ] && host="$(getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}')"
+            [ -z "$host" ] || [ "$host" = "*" ] && host="—"
+
+            st="$(client_state "$ip")"
+            case "$st" in
+                blocked) col="$C_BAD" ;;
+                bypass)  col="$C_WARN" ;;
+                *)       col="$C_OK" ;;
+            esac
+            printf '  %-16s %-19s %-22s %s%s%s\n' "$ip" "$mac" "${host:0:22}" "$col" "$st" "$C_OFF"
+        done
+
+    printf '\n  %sthis Pi%s          %-19s %-22s %s\n' \
+        "$C_DIM" "$C_OFF" "$(cat "/sys/class/net/$LAN_IF/address" 2>/dev/null)" "$(hostname)" "gateway"
+    printf '\n  %sblock/bypass any of these with:%s  vpngw block <ip>   vpngw bypass <ip>\n\n' \
+        "$C_DIM" "$C_OFF"
+}
+
+broadcast_addr() {
+    ip -o -4 addr show dev "$LAN_IF" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="brd"){print $(i+1); exit}}'
+}
+
+# ----------------------------------------------------------------------------
 # per-client lists
 # ----------------------------------------------------------------------------
 valid_target() {
@@ -569,6 +993,9 @@ usage() {
     vpngw restart        off + on
     vpngw status         show current state
     vpngw test           check the exit IP and DNS actually use the tunnel
+    vpngw doctor         diagnose the whole setup before something breaks
+    vpngw scan           list devices on the LAN and how each is routed
+    vpngw acct           per-client bandwidth (also: acct reset)
 
   per-client rules (applied live, no restart needed)
 
@@ -581,6 +1008,15 @@ usage() {
     vpngw user-unblock <user>  (they can still log in over SSH)
 
     vpngw clients        show all three lists
+
+  watchdog (reconnects the VPN when the tunnel dies)
+
+    vpngw watchdog on|off|status
+
+  web dashboard
+
+    vpngw web on|off|status
+    vpngw web-passwd     set the dashboard password
 
   other
 
@@ -597,6 +1033,13 @@ case "${1:-status}" in
     restart|reload)    cmd_off; cmd_on ;;
     status|st)         cmd_status ;;
     test|check)        cmd_test ;;
+    doctor|check-all)  cmd_doctor ;;
+    scan|devices)      cmd_scan ;;
+    acct|bandwidth|bw) cmd_acct "${2:-show}" ;;
+    watchdog)          cmd_watchdog "${2:-status}" ;;
+    watchdog-check)    cmd_watchdog_check ;;
+    web)               cmd_web "${2:-status}" ;;
+    web-passwd)        cmd_web_passwd ;;
     block)             cmd_list_edit BLOCK_IPS  block    "${2:-}" ;;
     unblock)           cmd_list_edit BLOCK_IPS  unblock  "${2:-}" ;;
     bypass)            cmd_list_edit BYPASS_IPS bypass   "${2:-}" ;;

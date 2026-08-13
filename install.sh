@@ -7,16 +7,20 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 
 echo "==> installing dependencies"
 apt-get update -qq
-apt-get install -y dnsmasq iptables curl dnsutils
+apt-get install -y dnsmasq iptables curl dnsutils iputils-ping python3
 
 # dnsmasq is controlled by vpngw, not by systemd at boot
 systemctl disable --now dnsmasq >/dev/null 2>&1 || true
 
 echo "==> installing /usr/local/sbin/vpngw"
 install -m 0755 "$SRC/vpngw" /usr/local/sbin/vpngw
+install -m 0755 "$SRC/vpngw-web" /usr/local/sbin/vpngw-web
+install -d -m 0755 /var/lib/vpngw
 
-echo "==> installing systemd unit"
-install -m 0644 "$SRC/systemd/vpn-gateway.service" /etc/systemd/system/vpn-gateway.service
+echo "==> installing systemd units"
+for u in vpn-gateway.service vpngw-watchdog.service vpngw-watchdog.timer vpngw-web.service; do
+    install -m 0644 "$SRC/systemd/$u" "/etc/systemd/system/$u"
+done
 systemctl daemon-reload
 
 if [ ! -f /etc/vpngw.conf ]; then
@@ -65,6 +69,21 @@ BYPASS_IPS=""
 # log in over SSH. Manage with: vpngw user-block <user> / user-unblock <user>
 BLOCK_USERS=""
 SSH_PORT=22
+
+# --- watchdog -------------------------------------------------------------
+# Command that brings your VPN back up, e.g. "xvpn connect". Leave empty and
+# the watchdog only detects and logs outages instead of fixing them.
+# Enable with: vpngw watchdog on
+VPN_RESTART_CMD=""
+WATCHDOG_PING_HOST="1.1.1.1"
+WATCHDOG_FAILS_BEFORE_ACTION=2
+WATCHDOG_COOLDOWN=120
+
+# --- web dashboard --------------------------------------------------------
+# Set a password with 'vpngw web-passwd', then start it with 'vpngw web on'
+WEB_PORT=8088
+WEB_BIND=""          # defaults to the Pi's LAN IP; "0.0.0.0" to listen on all
+WEB_USER="admin"
 EOF
     chmod 0644 /etc/vpngw.conf
     echo "    LAN_IF=$LAN_IF  LAN_CIDR=$LAN_CIDR  VPN_IF=$VPN_IF"
@@ -76,11 +95,17 @@ cat <<'EOF'
 
 ==> done.
 
+  Check everything:    sudo vpngw doctor
   Review the config:   sudo nano /etc/vpngw.conf
   Turn it on:          sudo vpngw on
-  Check it:            sudo vpngw status
+  See the LAN:         sudo vpngw scan
   Verify the tunnel:   sudo vpngw test
   Turn it off:         sudo vpngw off
   Survive reboots:     sudo vpngw enable-boot
+
+  Optional extras:
+    sudo vpngw watchdog on     auto-reconnect the VPN (set VPN_RESTART_CMD first)
+    sudo vpngw web-passwd      set a dashboard password
+    sudo vpngw web on          browse to http://<pi-ip>:8088
 
 EOF

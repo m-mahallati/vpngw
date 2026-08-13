@@ -1,0 +1,22 @@
+[Unit]
+Description=vpngw web dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/vpngw-web
+Restart=on-failure
+RestartSec=5
+
+# The dashboard shells out to `vpngw`, which needs root for iptables.
+# Everything else is locked down.
+NoNewPrivileges=no
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=no
+ProtectControlGroups=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target
