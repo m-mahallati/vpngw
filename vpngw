@@ -585,8 +585,12 @@ acct_sync() {
 # hosts worth counting: anything in the ARP table plus anything we have a rule for
 acct_hosts() {
     {
+        # 'ip neigh show dev X' prints "IP lladdr MAC STATE" but without the
+        # dev filter it prints "IP dev X lladdr MAC STATE", so the lladdr
+        # keyword is not at a fixed field number — scan for it instead.
+        # Entries with no lladdr at all (FAILED/INCOMPLETE) drop out for free.
         ip -4 neigh show dev "$LAN_IF" 2>/dev/null |
-            awk '$3 == "lladdr" && $NF != "FAILED" {print $1}'
+            awk '{ for (i = 2; i <= NF; i++) if ($i == "lladdr") { print $1; break } }'
         for i in $BLOCK_IPS $BYPASS_IPS; do printf '%s\n' "${i%%/*}"; done
     } | sort -u
 }
@@ -793,6 +797,8 @@ cmd_doctor() {
     have dnsmasq && d_ok "dnsmasq" "$(dnsmasq --version 2>/dev/null | head -1 | awk '{print $3}')" \
                  || d_bad "dnsmasq" "missing — apt install dnsmasq"
     have curl    && d_ok "curl"    || d_warn "curl"    "missing — 'vpngw test' won't work"
+    have conntrack && d_ok "conntrack" \
+                   || d_warn "conntrack" "missing — bypass/unbypass will strand a client's open connections"
     have dig     && d_ok "dig"     || d_warn "dig"     "missing — apt install dnsutils"
     have python3 && d_ok "python3" || d_warn "python3" "missing — the web dashboard needs it"
     if [ "$BLOCK_IPV6" = yes ]; then
@@ -1030,6 +1036,31 @@ list_del()  {
 }
 
 # reapply rules if the gateway is currently running
+# Moving a client between the tunnel and the uplink changes where its packets
+# are routed, but conntrack has already decided how each existing flow is NAT'd
+# and replays that decision for the life of the entry. A flow opened while the
+# client was bypassed carries no NAT binding, so after 'unbypass' it leaves via
+# the tunnel still sourced from the client's LAN address and the VPN peer
+# discards it; a flow opened through the tunnel carries a MASQUERADE binding to
+# the tunnel address, so after 'bypass' it leaves via the router with a source
+# the router will not route back. Either way the connection is a black hole
+# until conntrack expires it, which for established TCP is five days. New
+# connections are fine — which is why the client looks like it half-works.
+# Dropping the entries makes applications reconnect immediately.
+ct_flush_host() {
+    local ip="${1%%/*}"
+    if ! have conntrack; then
+        warn "conntrack tool not installed — existing connections from $ip will"
+        warn "hang until they time out (apt install conntrack to avoid this)"
+        return 0
+    fi
+    # both directions: the client as origin, and anything NAT'd back to it
+    conntrack -D -s "$ip" >/dev/null 2>&1
+    conntrack -D -d "$ip" >/dev/null 2>&1
+    log "flushed existing connection state for $ip"
+    return 0
+}
+
 reapply() {
     if state_is_on; then
         fw_apply
@@ -1081,6 +1112,12 @@ cmd_list_edit() {
         user-unblock) ok "user '$target' unblocked" ;;
     esac
     reapply
+
+    # bypass/unbypass moves the client between two paths with different NAT;
+    # stale conntrack entries would strand every connection it already had open
+    case "$action" in
+        bypass|unbypass) state_is_on && ct_flush_host "$target" ;;
+    esac
 
     if [ "$action" = user-block ]; then
         printf '\n'

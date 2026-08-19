@@ -126,7 +126,11 @@ LAN_GATEWAY="192.168.1.1"
 
 `vpngw clients` shows `(routed via <router>)` for each bypassed client when the rules are actually live, and flags them in red if not. `vpngw doctor` checks the same thing.
 
-A useful side effect: bypassed clients keep working when the tunnel is down, since their routing table has its own default and never depended on the VPN.
+A useful side effect: bypassed clients keep working when the tunnel is down, since their routing table has its own default and never depended on the VPN. By the same token the kill switch does not apply to them — a bypassed client is deliberately outside the tunnel, so `vpngw bypass` is a standing opt-out from VPN protection, not just a fallback for when the tunnel drops.
+
+Switching a client between the two paths only affects *new* connections. Conntrack decides how a flow is NAT'd when it starts and replays that decision until the entry expires, so a connection opened while the client was bypassed carries no NAT binding; after `unbypass` it goes into the tunnel still sourced from the client's LAN address, and the VPN peer discards it. The reverse happens too — a tunnelled flow keeps its MASQUERADE binding to the tunnel address and is unroutable once it leaves via your router. Those connections are black holes until conntrack times them out, which for established TCP is five days, while brand-new connections work perfectly. The result looks exactly like "this one device lost the internet" even though the routing and firewall are correct.
+
+`vpngw` therefore drops the conntrack entries for the client whenever `bypass` or `unbypass` changes its path. That does not rescue the old connection — its address on the far side has changed either way — but it turns a silent five-day hang into an immediate reset, which applications notice and recover from at once. That needs the `conntrack` tool (`apt install conntrack`); without it the command still works and warns you that open connections will hang until they expire.
 
 Note the device is probably still using the Pi for DNS, and dnsmasq resolves over the tunnel — if you want it fully off the VPN, point its DNS at your router too.
 
@@ -268,6 +272,8 @@ sudo rm -f /etc/resolv.conf && echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.
 **The Pi itself isn't going through the VPN** — that's your VPN client's routing, not this script. `vpngw` only handles forwarded traffic from other devices.
 
 **Watch what's flowing** — `sudo watch -n1 iptables -vnL VPNGW_FWD` shows live packet counts per rule; a climbing DROP counter means traffic is being blocked.
+
+**One device lost internet right after `bypass` or `unbypass`, everything else is fine** — its already-open connections were stranded by the path change, not blocked. Check with `sudo vpngw acct`: if that client still shows bytes moving in both directions, forwarding is healthy and it is only the old connections that are dead. Installing `conntrack` makes `vpngw` clear them automatically; otherwise restart the networking on that device, or just wait for the apps to give up and reconnect.
 
 **A bypassed client is still going through the VPN** — `sudo vpngw clients`. If it says "no ip rule active", the policy route didn't install; the usual cause is that `LAN_GATEWAY` couldn't be auto-detected. Set it explicitly in `/etc/vpngw.conf` and run `sudo vpngw restart`. Confirm with `ip rule show priority 100` and `ip route show table 51`.
 
