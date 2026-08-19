@@ -212,6 +212,10 @@ fw_apply() {
     iptables -t nat -I POSTROUTING 1 -j "$NAT_CHAIN"
 
     # --- FORWARD -------------------------------------------------------------
+    # Ordering matters more than the rules themselves: everything that is meant
+    # to *stop* traffic has to sit above the conntrack accept, or an already
+    # established flow sails straight past it.
+
     # 1. blacklisted clients die first, before the conntrack accept, so even
     #    already-established flows stop the moment you block them
     for b in $BLOCK_IPS; do
@@ -219,28 +223,44 @@ fw_apply() {
         iptables -A "$FWD_CHAIN" -o "$LAN_IF" -d "$b" -j DROP
     done
 
-    # 2. clamp MSS (non-terminating) so TCP survives the smaller tunnel MTU
+    # 2. bypass clients. route_apply() is what actually diverts them out the
+    #    uplink (via policy routing); these rules just permit the result, which
+    #    is why they match -o LAN_IF rather than the tunnel. Both directions are
+    #    listed explicitly because they sit above the conntrack accept — the
+    #    kill switch below has to, so these do too.
+    for b in $BYPASS_IPS; do
+        iptables -A "$FWD_CHAIN" -i "$LAN_IF" -o "$LAN_IF" -s "$b" -j ACCEPT
+        iptables -A "$FWD_CHAIN" -i "$LAN_IF" -o "$LAN_IF" -d "$b" -j ACCEPT
+    done
+
+    if [ "$KILL_SWITCH" = yes ]; then
+        # 3. the kill switch proper: LAN traffic not headed for the tunnel dies
+        #    here. This MUST be above the conntrack accept: a flow opened
+        #    while the tunnel was up is still ESTABLISHED after it dies, so
+        #    below the accept only brand-new connections get stopped.
+        #    MASQUERADE's device/address notifiers flush those entries when the
+        #    tunnel interface goes down, which masks the problem most of the
+        #    time — but that is the NAT layer cleaning up, not the firewall
+        #    holding the line, and it does not fire on every failure path.
+        iptables -A "$FWD_CHAIN" -i "$LAN_IF" ! -o "$VPN_IF" -j DROP
+    fi
+
+    # 4. clamp MSS (non-terminating) so TCP survives the smaller tunnel MTU
     iptables -A "$FWD_CHAIN" -o "$VPN_IF" -p tcp --tcp-flags SYN,RST SYN \
         -j TCPMSS --clamp-mss-to-pmtu
 
-    # 3. return traffic
+    # 5. return traffic
     iptables -A "$FWD_CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-    # 4. bypass clients. route_apply() is what actually diverts them out the
-    #    uplink (via policy routing); this rule just permits the result, which
-    #    is why it matches -o LAN_IF rather than the tunnel.
-    for b in $BYPASS_IPS; do
-        iptables -A "$FWD_CHAIN" -i "$LAN_IF" -o "$LAN_IF" -s "$b" -j ACCEPT
-    done
-
-    # 5. everyone else goes through the tunnel
+    # 6. everyone else goes through the tunnel
     iptables -A "$FWD_CHAIN" -i "$LAN_IF" -o "$VPN_IF" -s "$LAN_CIDR" -j ACCEPT
 
     if [ "$KILL_SWITCH" = yes ]; then
-        # anything from the LAN that did NOT match the tunnel rule above dies here,
-        # so when $VPN_IF is missing/down nothing leaks out over the uplink
+        # 7. backstop: LAN traffic aimed at the tunnel but not from LAN_CIDR
+        #    (rule 6 is the only thing that accepts it) never leaves this chain
         iptables -A "$FWD_CHAIN" -i "$LAN_IF" -j DROP
     fi
+
     iptables -I FORWARD 1 -j "$FWD_CHAIN"
 
     # --- accounting: one counter rule per direction per known host ----------
@@ -875,6 +895,20 @@ cmd_doctor() {
             && d_ok "ip_forward enabled" || d_bad "ip_forward is off" "but the gateway is on?"
         svc_active "$DNSMASQ_SERVICE" && d_ok "dnsmasq running" \
                                       || d_bad "dnsmasq not running" "journalctl -u $DNSMASQ_SERVICE"
+        if [ "$KILL_SWITCH" = yes ] && [ "$(id -u)" -eq 0 ]; then
+            # the drop has to be above the conntrack accept, or flows opened
+            # while the tunnel was up keep leaking after it dies
+            local ks ct
+            ks="$(iptables -S "$FWD_CHAIN" 2>/dev/null | grep -n -- "-i $LAN_IF ! -o $VPN_IF -j DROP" | cut -d: -f1 | head -1)"
+            ct="$(iptables -S "$FWD_CHAIN" 2>/dev/null | grep -n -- "--ctstate RELATED,ESTABLISHED -j ACCEPT" | cut -d: -f1 | head -1)"
+            if [ -z "$ks" ]; then
+                d_bad "kill-switch rule missing" "run 'vpngw restart'"
+            elif [ -n "$ct" ] && [ "$ks" -gt "$ct" ]; then
+                d_bad "kill-switch rule sits below the conntrack accept" "established flows will leak — run 'vpngw restart'"
+            else
+                d_ok "kill switch armed ahead of the conntrack accept"
+            fi
+        fi
     else
         d_ok "gateway is OFF" "nothing to check — run 'vpngw on' first"
     fi

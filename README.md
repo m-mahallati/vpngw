@@ -203,7 +203,8 @@ Check what it's been doing with `vpngw watchdog status`, which includes the rece
 2. Creates dedicated iptables chains `VPNGW_FWD`, `VPNGW_IN`, `VPNGW_OUT`, `VPNGW_NAT` (and `VPNGW_FWD6`) so your existing rules are never flushed:
    - MASQUERADE for `LAN_CIDR` leaving `VPN_IF`
    - MSS clamping so TCP survives the tunnel's smaller MTU
-   - accept established/related + LAN→tunnel, then **drop everything else from the LAN**
+   - **drop LAN traffic not headed for the tunnel** (the kill switch), placed above the established/related accept so existing flows die with the tunnel too
+   - accept established/related + LAN→tunnel
    - drop the Pi's own DNS queries to the upstream resolvers if they'd leave outside the tunnel
    - drop all IPv6 forwarding from the LAN
 3. Writes `/etc/dnsmasq.d/vpngw.conf` and starts dnsmasq, listening on the Pi's LAN IP and forwarding to `UPSTREAM_DNS` over the tunnel, with caching and `filter-AAAA`.
@@ -212,9 +213,15 @@ Check what it's been doing with `vpngw watchdog status`, which includes the rece
 
 ## Kill switch
 
-`KILL_SWITCH=yes` (default) means the accept rule is bound to `VPN_IF`, so if `xvpn-tun0` disappears or drops, client packets hit the final DROP instead of falling back to your plain uplink. Clients go dark rather than leaking. Set it to `no` in `/etc/vpngw.conf` if you'd rather they fall back to the normal WAN path — note that with a single-interface Pi that means hairpin NAT back out `eth0`.
+`KILL_SWITCH=yes` (default) installs `-i eth0 ! -o xvpn-tun0 -j DROP` in the FORWARD chain, so if `xvpn-tun0` disappears or drops, client packets are dropped instead of falling back to your plain uplink. Clients go dark rather than leaking. Set it to `no` in `/etc/vpngw.conf` if you'd rather they fall back to the normal WAN path — note that with a single-interface Pi that means hairpin NAT back out `eth0`.
 
-The kill switch is passive: rules are keyed by interface name, so a VPN reconnect resumes working automatically with no need to re-run `vpngw on`.
+That rule sits **above** the `RELATED,ESTABLISHED` accept, and the position is the whole point. A connection opened while the tunnel was up stays ESTABLISHED after the tunnel dies, so with the accept first, only *new* connections are stopped — every flow already open matches the accept and is forwarded out `eth0` in the clear. Same reason the per-client blacklist drops sit above the accept.
+
+It used to be below. In practice that was usually masked: `MASQUERADE` (unlike a plain `SNAT`) registers device and address notifiers that destroy the conntrack entries bound to an interface, so when `xvpn-tun0` goes down the entries that would have been waved through are flushed a moment earlier, and the packets arrive as `NEW` and hit the drop. That is a NAT side effect, not a property of the ruleset — swap `MASQUERADE` for `SNAT`, or hit a path where the flush doesn't fire, and established flows leak out the uplink with the tunnel's stale source address. Verified both ways in network namespaces: with the drop below the accept the payload is readable on the uplink wire, with it above the same packets are dropped. The point of the ordering is that the guarantee comes from the rules rather than from what the NAT layer happens to clean up.
+
+`vpngw doctor` checks this ordering explicitly.
+
+The kill switch is passive: rules are keyed by interface name, so a VPN reconnect resumes working automatically with no need to re-run `vpngw on`. Connections that were open when the tunnel dropped stay broken after it comes back, since their conntrack entries hold the old tunnel's SNAT — they die on their own and clients reconnect.
 
 `DNS_LEAK_GUARD=yes` extends this to the Pi's own resolver traffic — queries to `UPSTREAM_DNS` are dropped unless they leave via the tunnel. One caveat: if the Pi's own `/etc/resolv.conf` points at one of those same servers, the Pi loses DNS while the tunnel is down. `vpngw on` warns you if it detects this; either point `/etc/resolv.conf` at `127.0.0.1` (dnsmasq) or set `DNS_LEAK_GUARD=no`.
 
